@@ -109,3 +109,42 @@ WHERE jobname = 'daily-alert-9am';
 
 -- Eliminar el job si hace falta recrearlo:
 -- SELECT cron.unschedule('daily-alert-9am');
+
+
+-- =============================================================
+-- FEAT: Drama push — aviso cuando alguien te adelanta
+-- Se lanza 5 minutos después de cada poll-results (*/30 + 5 min)
+-- =============================================================
+
+-- ── PASO 6: Programar drama-push cada 30 min (offset +5 min) ─
+
+SELECT cron.schedule(
+  'drama-push-30min',
+  '5,35 * * * *',                  -- :05 y :35 de cada hora
+  $$
+    SELECT net.http_post(
+      url     := 'https://eflomqqolasqiixbsnbf.supabase.co/functions/v1/drama-push',
+      headers := jsonb_build_object(
+        'Content-Type',  'application/json',
+        'Authorization', 'Bearer sb_publishable_KWbMr9Rf252tBegwQTa3lg_iy0J9TSh'
+      ),
+      body    := '{}'::jsonb
+    );
+  $$
+);
+
+-- Verificar:
+-- SELECT jobid, jobname, schedule FROM cron.job WHERE jobname = 'drama-push-30min';
+
+-- Ejecutar manualmente:
+-- SELECT net.http_post(
+--   url     := 'https://eflomqqolasqiixbsnbf.supabase.co/functions/v1/drama-push',
+--   headers := jsonb_build_object(
+--     'Content-Type',  'application/json',
+--     'Authorization', 'Bearer sb_publishable_KWbMr9Rf252tBegwQTa3lg_iy0J9TSh'
+--   ),
+--   body    := '{}'::jsonb
+-- );
+
+-- Eliminar:
+-- SELECT cron.unschedule('drama-push-30min');
