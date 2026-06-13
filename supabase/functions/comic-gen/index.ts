@@ -1,31 +1,25 @@
 /**
- * comic-gen — Viñeta de grupo por jornada
+ * comic-gen — Viñeta de grupo por jornada (v3)
  *
  * Flujo en dos pasos:
- *   1. Gemini texto (gemini-1.5-flash) → descripción detallada de la escena:
- *      quién triunfó, quién hizo el ridículo, interacciones cómicas,
- *      estilo Twitter Fútbol España.
- *   2. Gemini imagen (gemini-2.0-flash-exp, responseModalities IMAGE) →
- *      viñeta de cómic con bocadillos, pasando las fotos de referencia
- *      de los jugadores que las tengan subidas.
+ *   1. gemini-2.5-flash (texto) → descripción detallada de la escena
+ *   2. gemini-2.5-flash-image (imagen, "Nano Banana") → viñeta cómica
+ *      pasando las fotos de referencia como partes inline.
  *
- * Input (POST JSON): { league_id: string, match_day: string "YYYY-MM-DD" }
- * Output: { ok: true, url: string } | { ok: false, error: string }
+ * Input (POST JSON): { league_id: string, match_day: "YYYY-MM-DD" }
+ * Output: { ok: true, url } | { ok: false, error }
  *
- * Secrets necesarios:
- *   GEMINI_API_KEY   — Google AI Studio (mismo para texto e imagen)
+ * Llamado por:
+ *   - El usuario manualmente (frontend → StandingsTab)
+ *   - poll-results automáticamente al terminar todos los partidos del día
  *
- * NO usa Imagen 3 ni gemini-3-pro-image-preview.
- *
- * Modelo de imagen: gemini-2.0-flash-exp con responseModalities: ["IMAGE"]
- * → gratuito, acepta imágenes de entrada (fotos de referencia) y genera imagen.
- * Si el modelo no está disponible, devuelve { ok: false, error: "image_model_unavailable" }.
+ * Secrets: GEMINI_API_KEY
  */
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-const IMAGE_MODEL = "gemini-2.0-flash-exp";
-const TEXT_MODEL  = "gemini-1.5-flash";
+const TEXT_MODEL  = "gemini-2.5-flash";           // texto: descripción de escena
+const IMAGE_MODEL = "gemini-2.5-flash-image";     // imagen: Nano Banana (gratuito, ref-images OK)
 const GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta";
 
 Deno.serve(async (req: Request) => {
@@ -50,7 +44,20 @@ Deno.serve(async (req: Request) => {
       Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
     );
 
-    // ── 1. Datos del día: partidos + miembros + predicciones ──
+    // ── 1. Comprobar si ya existe una viñeta para este día + liga ─
+    { const { data: existing } = await supabase
+        .from("daily_comics")
+        .select("id, image_url")
+        .eq("league_id", league_id)
+        .eq("match_day", match_day)
+        .maybeSingle();
+      if (existing?.image_url) {
+        console.log(`[comic-gen] Ya existe viñeta para ${league_id}/${match_day}. Devolviendo URL existente.`);
+        return respond({ ok: true, url: existing.image_url, cached: true });
+      }
+    }
+
+    // ── 2. Datos del día ──────────────────────────────────────────
     const dayStart = `${match_day}T00:00:00Z`;
     const dayEnd   = `${match_day}T23:59:59Z`;
 
@@ -74,32 +81,34 @@ Deno.serve(async (req: Request) => {
       return respond({ ok: false, error: "no_matches: sin partidos finalizados ese día" }, 404);
     }
 
-    const matchIds    = dayMatches.map((m: any) => m.id);
-    const membersList = (members ?? []).map((m: any) => ({
-      userId:     m.user_id,
-      name:       m.profiles?.display_name ?? m.user_id.slice(0, 8),
-      avatar_url: m.profiles?.avatar_url ?? null,
-    }));
+    const membersList: Array<{ userId: string; name: string; avatar_url: string | null }> =
+      (members ?? []).map((m: any) => ({
+        userId:     m.user_id,
+        name:       m.profiles?.display_name ?? m.user_id.slice(0, 8),
+        avatar_url: m.profiles?.avatar_url ?? null,
+      }));
 
+    const matchIds = dayMatches.map((m: any) => m.id);
     const { data: preds } = await supabase
       .from("predictions")
       .select("user_id, match_id, home_goals, away_goals")
       .eq("league_id", league_id)
       .in("match_id", matchIds);
 
-    // ── 2. Calcular puntos por jugador ese día ────────────────
+    // ── 3. Calcular puntos + racha por jugador ────────────────────
     type PlayerDay = {
       userId: string; name: string; avatar_url: string | null;
-      pts: number; exacts: number; zeros: number; total: number;
+      pts: number; exacts: number; zeros: number; hasPreds: boolean;
     };
     const playerMap: Record<string, PlayerDay> = {};
     membersList.forEach(m => {
-      playerMap[m.userId] = { ...m, pts: 0, exacts: 0, zeros: 0, total: dayMatches.length };
+      playerMap[m.userId] = { ...m, pts: 0, exacts: 0, zeros: 0, hasPreds: false };
     });
 
     for (const p of (preds ?? [])) {
       const m = dayMatches.find((x: any) => x.id === p.match_id);
       if (!m || !playerMap[p.user_id]) continue;
+      playerMap[p.user_id].hasPreds = true;
       if (p.home_goals === m.home_goals && p.away_goals === m.away_goals) {
         playerMap[p.user_id].pts    += 3;
         playerMap[p.user_id].exacts += 1;
@@ -110,24 +119,63 @@ Deno.serve(async (req: Request) => {
       }
     }
 
-    const players = Object.values(playerMap).sort((a, b) => b.pts - a.pts);
+    // Solo jugadores que predijeron algo ese día
+    const activePlayers = Object.values(playerMap)
+      .filter(p => p.hasPreds)
+      .sort((a, b) => b.pts - a.pts);
 
-    // ── 3. Gemini texto → descripción de la escena ────────────
-    const matchSummary = dayMatches.map((m: any) =>
-      `${m.home_team} ${m.home_goals}-${m.away_goals} ${m.away_team}`
-    ).join(", ");
+    if (activePlayers.length === 0) {
+      return respond({ ok: false, error: "no_predictions: ningún jugador predijo ese día" }, 404);
+    }
 
-    const playerSummary = players.map(p => {
+    // Calcular rachas históricas (últimos partidos finalizados antes del día)
+    const { data: recentPreds } = await supabase
+      .from("predictions")
+      .select("user_id, match_id, home_goals, away_goals")
+      .eq("league_id", league_id);
+
+    const { data: recentMatches } = await supabase
+      .from("matches")
+      .select("id, home_goals, away_goals, kickoff, is_final")
+      .eq("is_final", true)
+      .lt("kickoff", dayStart)
+      .order("kickoff", { ascending: false })
+      .limit(60);
+
+    const streakMap: Record<string, string> = {};
+    for (const player of activePlayers) {
+      const playerHistPreds = (recentPreds ?? []).filter((p: any) => p.user_id === player.userId);
+      const lastMatches = (recentMatches ?? []).slice(0, 5);
+      let streak = "";
+      for (const m of lastMatches) {
+        const p = playerHistPreds.find((pp: any) => pp.match_id === m.id);
+        if (!p) break;
+        if (p.home_goals === m.home_goals && p.away_goals === m.away_goals) streak += "✓";
+        else if (p.home_goals === m.home_goals || p.away_goals === m.away_goals) streak += "~";
+        else streak += "✗";
+      }
+      streakMap[player.userId] = streak || "—";
+    }
+
+    // ── 4. Gemini texto → descripción de escena ──────────────────
+    const matchSummary = dayMatches
+      .map((m: any) => `${m.home_team} ${m.home_goals}-${m.away_goals} ${m.away_team}`)
+      .join(", ");
+
+    const playerSummary = activePlayers.map((p, i) => {
       const predLine = (preds ?? [])
         .filter((pred: any) => pred.user_id === p.userId)
         .map((pred: any) => {
           const m = dayMatches.find((x: any) => x.id === pred.match_id);
           if (!m) return "";
-          return `${m.home_team} ${pred.home_goals}-${pred.away_goals} ${m.away_team}`;
+          return `${(m as any).home_team} ${pred.home_goals}-${pred.away_goals} ${(m as any).away_team}`;
         })
         .filter(Boolean)
         .join("; ");
-      return `${p.name}: ${p.pts} pts (${p.exacts} exactos, ${p.zeros} ceros). Pronosticó: ${predLine || "nada"}`;
+      const rank   = i + 1;
+      const racha  = streakMap[p.userId] || "—";
+      const foto   = p.avatar_url ? "tiene foto" : "sin foto";
+      return `${rank}. ${p.name} [${foto}]: ${p.pts}pts (${p.exacts} exactos, ${p.zeros} ceros). Racha: ${racha}. Pronosticó: ${predLine || "nada"}`;
     }).join("\n");
 
     const textPrompt = `Eres el guionista de una viñeta cómica de una porra del Mundial 2026, estilo cómic español, humor negro y sarcástico tipo Twitter Fútbol.
@@ -135,48 +183,54 @@ Deno.serve(async (req: Request) => {
 RESULTADOS DEL DÍA:
 ${matchSummary}
 
-JUGADORES (de mejor a peor):
+JUGADORES (de mejor a peor del día):
 ${playerSummary}
+(racha: ✓=exacto, ~=parcial, ✗=cero)
 
-Escribe una descripción detallada de UNA SOLA viñeta cómica grupal con todos los jugadores juntos:
-- El primero (${players[0]?.name}) aparece triunfante, eufórico, en posición central o elevada
-- El último (${players[players.length - 1]?.name}) aparece hundido, avergonzado, ridiculizado
-- Los demás en posiciones intermedias acordes a sus puntos
-- Incluye bocadillos de diálogo con frases cortas y sarcásticas (en español, máx 6 palabras cada una)
-- Fondo: estadio de fútbol con pancartas del Mundial 2026
-- Estilo: viñeta de cómic europeo con líneas gruesas, colores vibrantes, expresiones exageradas
-- Que los personajes interactúen entre sí (burlas, celebraciones, lamentos)
+Escribe una descripción detallada de UNA SOLA viñeta cómica grupal con todos los jugadores:
+- ${activePlayers[0]?.name} (1º) aparece triunfante, eufórico, en posición central o elevada
+- ${activePlayers[activePlayers.length - 1]?.name} (último) aparece hundido, avergonzado, ridiculizado
+- Los intermedios en posiciones acordes
+- Bocadillos de diálogo cortos y sarcásticos (máx 6 palabras cada uno, en español)
+- Fondo: estadio del Mundial 2026
+- Los jugadores sin foto se representan como siluetas con su nombre en el bocadillo
+- Que interactúen entre sí con burlas, celebraciones o lamentos
 
-Sé muy específico: describe poses, expresiones faciales, bocadillos exactos, composición.
-Máximo 200 palabras. Solo la descripción visual, sin título ni intro.`;
+Sé muy específico sobre poses, expresiones y bocadillos exactos. Máximo 200 palabras. Solo descripción visual.`;
 
     const textRes = await fetch(
       `${GEMINI_BASE}/models/${TEXT_MODEL}:generateContent?key=${geminiKey}`,
       {
         method:  "POST",
         headers: { "Content-Type": "application/json" },
-        body:    JSON.stringify({
+        body: JSON.stringify({
           contents: [{ parts: [{ text: textPrompt }] }],
           generationConfig: { maxOutputTokens: 400, temperature: 1.0 },
         }),
       }
     );
-    if (!textRes.ok) throw new Error(`Gemini texto ${textRes.status}: ${await textRes.text()}`);
+    if (!textRes.ok) {
+      const errBody = await textRes.text();
+      throw new Error(`Gemini ${TEXT_MODEL} ${textRes.status}: ${errBody.slice(0, 300)}`);
+    }
     const textData = await textRes.json();
     const sceneDesc = textData?.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
     if (!sceneDesc) throw new Error("Gemini texto devolvió respuesta vacía.");
-    console.log("[comic-gen] escena:", sceneDesc.slice(0, 120) + "…");
+    console.log("[comic-gen] escena generada:", sceneDesc.slice(0, 100) + "…");
 
-    // ── 4. Recoger fotos de referencia (base64) ───────────────
-    type PhotoPart = { inlineData: { mimeType: string; data: string } };
-    const photoParts: PhotoPart[] = [];
+    // ── 5. Fotos de referencia (base64) ──────────────────────────
+    type InlineData = { inlineData: { mimeType: string; data: string } };
+    const photoParts: InlineData[] = [];
     const photoNames: string[] = [];
 
-    for (const p of players) {
+    for (const p of activePlayers) {
       if (!p.avatar_url) continue;
       try {
         const imgRes = await fetch(p.avatar_url);
-        if (!imgRes.ok) { console.warn(`[comic-gen] foto de ${p.name} no accesible (${imgRes.status})`); continue; }
+        if (!imgRes.ok) {
+          console.warn(`[comic-gen] foto de ${p.name} no accesible (${imgRes.status})`);
+          continue;
+        }
         const buf  = await imgRes.arrayBuffer();
         const b64  = btoa(String.fromCharCode(...new Uint8Array(buf)));
         const mime = imgRes.headers.get("content-type") || "image/jpeg";
@@ -187,22 +241,25 @@ Máximo 200 palabras. Solo la descripción visual, sin título ni intro.`;
       }
     }
 
-    // ── 5. Gemini imagen → viñeta PNG ─────────────────────────
-    const refNote = photoNames.length > 0
-      ? `Usa las siguientes ${photoNames.length} fotos de referencia para representar a: ${photoNames.join(", ")}. Para los jugadores sin foto, usa siluetas con el nombre.`
-      : "Ningún jugador tiene foto de referencia; usa siluetas caricaturizadas con nombres y motes.";
+    console.log(`[comic-gen] fotos de referencia: ${photoNames.length}/${activePlayers.length} (${photoNames.join(", ") || "ninguna"})`);
 
-    const imagePrompt = `Comic strip panel in European comic style (clear outlines, vibrant colors, exaggerated expressions, speech bubbles in Spanish). One single panel, square format.
+    // ── 6. gemini-2.5-flash-image → viñeta ───────────────────────
+    const withPhotos = photoNames.length > 0;
+    const refNote = withPhotos
+      ? `Usa las ${photoNames.length} foto(s) de referencia adjuntas para representar a: ${photoNames.join(", ")}. Para el resto, usa siluetas con el nombre visible.`
+      : `Ningún jugador tiene foto; usa siluetas caricaturizadas con etiquetas de nombre.`;
+
+    const imagePrompt = `European comic strip panel style: thick outlines, vibrant flat colors, exaggerated expressions, speech bubbles in Spanish.
+One single square panel with all players in one scene.
 
 ${sceneDesc}
 
-Players: ${players.map(p => p.name).join(", ")}.
 ${refNote}
 
-Important: no watermarks, no extra panels, one unified scene with all characters interacting.`;
+No extra panels. No watermarks. No text outside speech bubbles.`;
 
-    const imageParts: Array<{ text: string } | PhotoPart> = [
-      ...photoParts,
+    const imageParts: Array<{ text: string } | InlineData> = [
+      ...photoParts,          // fotos de referencia primero (si las hay)
       { text: imagePrompt },
     ];
 
@@ -211,7 +268,7 @@ Important: no watermarks, no extra panels, one unified scene with all characters
       {
         method:  "POST",
         headers: { "Content-Type": "application/json" },
-        body:    JSON.stringify({
+        body: JSON.stringify({
           contents: [{ parts: imageParts }],
           generationConfig: {
             responseModalities: ["IMAGE", "TEXT"],
@@ -223,31 +280,38 @@ Important: no watermarks, no extra panels, one unified scene with all characters
 
     if (!imageRes.ok) {
       const errText = await imageRes.text();
-      console.error("[comic-gen] Gemini imagen error:", imageRes.status, errText);
-      // Errores esperados: modelo no disponible, quota, etc.
+      console.error(`[comic-gen] ${IMAGE_MODEL} error ${imageRes.status}:`, errText.slice(0, 400));
       return respond({
-        ok:    false,
-        error: "image_model_unavailable",
-        hint:  `Gemini ${IMAGE_MODEL} no disponible con esta API key o excedida la quota. Status ${imageRes.status}.`,
+        ok:     false,
+        error:  "image_model_unavailable",
+        status: imageRes.status,
+        hint:   `Modelo ${IMAGE_MODEL} no disponible o quota agotada. Verifica API key de Google AI Studio.`,
         detail: errText.slice(0, 300),
       }, 503);
     }
 
     const imageData = await imageRes.json();
-    const imagePart = imageData?.candidates?.[0]?.content?.parts?.find(
-      (part: any) => part.inlineData?.mimeType?.startsWith("image/")
-    );
 
-    if (!imagePart?.inlineData?.data) {
-      console.error("[comic-gen] Gemini imagen no devolvió imagen. Respuesta:", JSON.stringify(imageData).slice(0, 500));
+    // La imagen puede venir en candidates[0].content.parts[].inlineData o en parts directamente
+    const candidates = imageData?.candidates ?? [];
+    let imgPart: any = null;
+    for (const c of candidates) {
+      imgPart = (c?.content?.parts ?? []).find(
+        (part: any) => part?.inlineData?.mimeType?.startsWith("image/")
+      );
+      if (imgPart) break;
+    }
+
+    if (!imgPart?.inlineData?.data) {
+      console.error("[comic-gen] No se encontró imagen en la respuesta:", JSON.stringify(imageData).slice(0, 500));
       return respond({ ok: false, error: "no_image_in_response" }, 500);
     }
 
-    const imgB64 = imagePart.inlineData.data;
-    const imgMime = imagePart.inlineData.mimeType || "image/png";
+    const imgB64  = imgPart.inlineData.data;
+    const imgMime = imgPart.inlineData.mimeType || "image/png";
     const imgExt  = imgMime.includes("png") ? "png" : "jpg";
 
-    // ── 6. Subir a Storage ────────────────────────────────────
+    // ── 7. Subir a Storage ────────────────────────────────────────
     const binary = Uint8Array.from(atob(imgB64), c => c.charCodeAt(0));
     const path   = `comics/${league_id}/${match_day}.${imgExt}`;
 
@@ -260,17 +324,17 @@ Important: no watermarks, no extra panels, one unified scene with all characters
     const { data: { publicUrl } } = supabase.storage.from("avatars").getPublicUrl(path);
     const url = `${publicUrl}?t=${Date.now()}`;
 
-    // ── 7. Guardar en daily_comics ────────────────────────────
+    // ── 8. Guardar en daily_comics ────────────────────────────────
     await supabase.from("daily_comics").upsert(
       { league_id, match_day, image_url: url, created_at: new Date().toISOString() },
       { onConflict: "league_id,match_day" }
     );
 
-    console.log(`[comic-gen] viñeta generada: ${url}`);
-    return respond({ ok: true, url, scene: sceneDesc.slice(0, 100) });
+    console.log(`[comic-gen] ✓ viñeta para ${league_id}/${match_day}: ${url}`);
+    return respond({ ok: true, url, players: activePlayers.length, photos: photoNames.length });
 
   } catch (err: any) {
-    console.error("[comic-gen] error:", err);
+    console.error("[comic-gen] error fatal:", err);
     return respond({ ok: false, error: err.message }, 500);
   }
 });

@@ -751,7 +751,7 @@ function LeagueView({ league, theme, tab, setTab, onBack, upsertPrediction, setC
       <div className="pm-tabbody">
         {tab === "prediccion"    && <PredictionTab  league={league} upsertPrediction={upsertPrediction} setChampion={setChampion} />}
         {tab === "clasificacion" && <StandingsTab   league={league} />}
-        {tab === "resultados"    && <ResultsTab league={league} />}
+        {tab === "resultados"    && <ResultsTab />}
         {tab === "historico"     && <HistoryTab />}
         {tab === "cronica"       && <RecapTab       league={league} />}
       </div>
@@ -985,8 +985,28 @@ function Side({ label, name, logo, val, setVal }) {
 /* ─── Clasificación ──────────────────────────────────────── */
 function StandingsTab({ league }) {
   const { userId, profiles, leaguePredictions, matchById, refreshMatches } = useUser();
-  const [phase,      setPhase]      = useState("general");
-  const [refreshing, setRefreshing] = useState(false);
+  const [phase,       setPhase]       = useState("general");
+  const [refreshing,  setRefreshing]  = useState(false);
+  // Viñeta más reciente para esta liga
+  const [comic,       setComic]       = useState(null); // { url, day } | null
+  const [comicState,  setComicState]  = useState("idle"); // "idle" | "loading" | "error"
+  const [comicErr,    setComicErr]    = useState("");
+  const [comicModal,  setComicModal]  = useState(false);
+
+  // Carga la viñeta más reciente al montar / cambiar de liga
+  useEffect(() => {
+    if (!league?.id) return;
+    supabase
+      .from("daily_comics")
+      .select("match_day, image_url")
+      .eq("league_id", league.id)
+      .order("match_day", { ascending: false })
+      .limit(1)
+      .maybeSingle()
+      .then(({ data }) => {
+        if (data?.image_url) setComic({ url: data.image_url, day: data.match_day });
+      });
+  }, [league?.id]);
 
   const rows = useMemo(() => {
     return league.members
@@ -1012,6 +1032,57 @@ function StandingsTab({ league }) {
     setRefreshing(false);
   }
 
+  // Generación manual (fallback si aún no existe viñeta automática)
+  async function handleGenerateComic() {
+    setComicState("loading");
+    setComicErr("");
+    const { data: { session } } = await supabase.auth.getSession();
+    if (!session) { setComicState("error"); setComicErr("Sin sesión activa."); return; }
+
+    // Busca el último día con partidos finalizados
+    const { data: lastMatch } = await supabase
+      .from("matches")
+      .select("kickoff")
+      .eq("is_final", true)
+      .order("kickoff", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (!lastMatch) { setComicState("error"); setComicErr("No hay partidos finalizados todavía."); return; }
+    const matchDay = lastMatch.kickoff.slice(0, 10);
+
+    try {
+      const res = await fetch(
+        `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/comic-gen`,
+        {
+          method:  "POST",
+          headers: { "Content-Type": "application/json", "Authorization": `Bearer ${session.access_token}` },
+          body:    JSON.stringify({ league_id: league.id, match_day: matchDay }),
+        }
+      );
+      const json = await res.json();
+      if (json.ok && json.url) {
+        setComic({ url: json.url, day: matchDay });
+        setComicState("idle");
+        setComicModal(true);
+      } else if (json.error === "image_model_unavailable") {
+        setComicState("error");
+        setComicErr(`Modelo de imagen no disponible. ${json.hint || ""}`);
+      } else {
+        setComicState("error");
+        setComicErr(json.error || "Error desconocido al generar la viñeta.");
+      }
+    } catch (e) {
+      setComicState("error");
+      setComicErr(e?.message || String(e));
+    }
+  }
+
+  function fmtDay(dateStr) {
+    return new Date(dateStr + "T12:00:00Z").toLocaleDateString("es-ES",
+      { weekday: "long", day: "numeric", month: "long" });
+  }
+
   return (
     <div className="pm-pad">
       <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 14 }}>
@@ -1024,6 +1095,7 @@ function StandingsTab({ league }) {
           {refreshing ? "…" : "↺"}
         </button>
       </div>
+
       <div className="pm-table">
         {rows.map((r, i) => (
           <div key={r.u} className={"pm-row" + (r.u === userId ? " is-me" : "")}>
@@ -1046,21 +1118,57 @@ function StandingsTab({ league }) {
           </div>
         ))}
       </div>
+
+      {/* ── Viñeta del día ────────────────────────────────────── */}
+      <div className="pm-comic-section">
+        {comic?.url ? (
+          // Viñeta disponible: miniatura + botón
+          <button className="pm-comic-thumb-btn" onClick={() => setComicModal(true)}>
+            <img src={comic.url} alt="Viñeta del grupo" className="pm-comic-thumb" />
+            <div className="pm-comic-thumb-meta">
+              <span className="pm-comic-thumb-label">🎨 Viñeta del grupo</span>
+              {comic.day && <span className="pm-comic-thumb-day">{fmtDay(comic.day)}</span>}
+            </div>
+          </button>
+        ) : comicState === "loading" ? (
+          <div className="pm-note pm-note-loading">🎨 Generando viñeta del grupo… (puede tardar 30-60 s)</div>
+        ) : comicState === "error" ? (
+          <>
+            <div className="pm-note" style={{ color: "rgba(255,100,100,.85)", marginBottom: 8 }}>{comicErr}</div>
+            <button className="pm-btn pm-btn-sm pm-btn-comic" onClick={handleGenerateComic}>
+              Reintentar
+            </button>
+          </>
+        ) : (
+          // Sin viñeta todavía — generación automática o manual
+          <button className="pm-btn pm-btn-sm pm-btn-comic" onClick={handleGenerateComic}>
+            🎨 Mostrar viñeta del grupo
+          </button>
+        )}
+      </div>
+
+      {/* Modal viñeta ampliada */}
+      {comicModal && comic?.url && (
+        <div className="pm-overlay" onClick={() => setComicModal(false)}>
+          <div className="pm-comic-modal" onClick={e => e.stopPropagation()}>
+            <div className="pm-modal-head">
+              <h3>Viñeta{comic.day ? ` · ${fmtDay(comic.day)}` : ""}</h3>
+              <button className="pm-close" onClick={() => setComicModal(false)}>✕</button>
+            </div>
+            <img src={comic.url} alt="Viñeta del grupo" style={{ width: "100%", borderRadius: 12 }} />
+          </div>
+        </div>
+      )}
     </div>
   );
 }
 
 /* ─── Resultados ─────────────────────────────────────────── */
-function ResultsTab({ league }) {
+function ResultsTab() {
   const { matches, refreshMatches } = useUser();
   const [refreshing, setRefreshing] = useState(false);
   const [scorers,    setScorers]    = useState([]);
-  // comics: { [YYYY-MM-DD]: { url?, loading?, error? } }
-  const [comics,     setComics]     = useState({});
-  // viñeta ampliada: { day, url }
-  const [enlarged,   setEnlarged]   = useState(null);
 
-  // Carga goleadores
   useEffect(() => {
     supabase
       .from("player_stats")
@@ -1069,21 +1177,6 @@ function ResultsTab({ league }) {
       .limit(20)
       .then(({ data }) => setScorers(data || []));
   }, []);
-
-  // Carga viñetas ya generadas para esta liga
-  useEffect(() => {
-    if (!league?.id) return;
-    supabase
-      .from("daily_comics")
-      .select("match_day, image_url")
-      .eq("league_id", league.id)
-      .then(({ data }) => {
-        if (!data) return;
-        const map = {};
-        data.forEach(c => { map[c.match_day] = { url: c.image_url }; });
-        setComics(map);
-      });
-  }, [league?.id]);
 
   // Agrupa partidos finalizados por día UTC, más reciente primero
   const byDay = useMemo(() => {
@@ -1109,46 +1202,6 @@ function ResultsTab({ league }) {
     setRefreshing(false);
   }
 
-  async function handleGenerateComic(matchDay) {
-    setComics(prev => ({ ...prev, [matchDay]: { loading: true } }));
-    const { data: { session } } = await supabase.auth.getSession();
-    if (!session) {
-      setComics(prev => ({ ...prev, [matchDay]: { error: "Sin sesión activa" } }));
-      return;
-    }
-    try {
-      const res = await fetch(
-        `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/comic-gen`,
-        {
-          method:  "POST",
-          headers: {
-            "Content-Type":  "application/json",
-            "Authorization": `Bearer ${session.access_token}`,
-          },
-          body: JSON.stringify({ league_id: league.id, match_day: matchDay }),
-        }
-      );
-      const json = await res.json();
-      if (json.ok && json.url) {
-        setComics(prev => ({ ...prev, [matchDay]: { url: json.url } }));
-        setEnlarged({ day: matchDay, url: json.url });
-      } else if (json.error === "image_model_unavailable") {
-        setComics(prev => ({ ...prev, [matchDay]: { error: "Gemini imagen no disponible con esta API key. " + (json.hint || "") } }));
-      } else {
-        setComics(prev => ({ ...prev, [matchDay]: { error: json.error || "Error desconocido" } }));
-      }
-    } catch (e) {
-      setComics(prev => ({ ...prev, [matchDay]: { error: e?.message || String(e) } }));
-    }
-  }
-
-  function fmtDay(dateStr) {
-    // dateStr = "YYYY-MM-DD"
-    return new Date(dateStr + "T12:00:00Z").toLocaleDateString("es-ES", {
-      weekday: "long", day: "numeric", month: "long",
-    });
-  }
-
   return (
     <div className="pm-pad">
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", margin: "22px 2px 12px" }}>
@@ -1158,74 +1211,32 @@ function ResultsTab({ league }) {
         </button>
       </div>
 
-      {byDay.length === 0 && (
-        <div className="pm-note">Aún no hay partidos finalizados.</div>
-      )}
+      {byDay.length === 0 && <div className="pm-note">Aún no hay partidos finalizados.</div>}
 
-      {byDay.map(([day, dayMatches]) => {
-        const comic = comics[day];
-        return (
-          <div key={day} className="pm-day-group">
-            <div className="pm-day-label">{fmtDay(day)}</div>
-
-            {dayMatches.map(m => (
-              <div key={m.id} className="pm-result">
-                <div className="pm-result-side">
-                  <TeamLogo src={m.home_logo} name={m.home_team} size={16} />{" "}{m.home_team}
-                </div>
-                <div className="pm-result-score">{m.home_goals}<span>–</span>{m.away_goals}</div>
-                <div className="pm-result-side pm-result-side-r">
-                  {m.away_team}{" "}<TeamLogo src={m.away_logo} name={m.away_team} size={16} />
-                </div>
-              </div>
-            ))}
-
-            {/* Sección viñeta de grupo */}
-            {league && (
-              <div className="pm-day-comic-row">
-                {comic?.url ? (
-                  <button className="pm-comic-thumb-btn" onClick={() => setEnlarged({ day, url: comic.url })}
-                    title="Ver viñeta completa">
-                    <img src={comic.url} alt={`Viñeta ${day}`} className="pm-comic-thumb" />
-                    <span className="pm-comic-thumb-label">Ver viñeta →</span>
-                  </button>
-                ) : comic?.loading ? (
-                  <div className="pm-note pm-note-loading">🎨 Generando viñeta… (30-60 s)</div>
-                ) : comic?.error ? (
-                  <details className="pm-comic-err">
-                    <summary>⚠ No se pudo generar la viñeta</summary>
-                    <div className="pm-note" style={{ marginTop: 4 }}>{comic.error}</div>
-                  </details>
-                ) : (
-                  <button className="pm-btn pm-btn-sm pm-btn-comic"
-                    onClick={() => handleGenerateComic(day)}>
-                    🎨 Mostrar viñeta del grupo
-                  </button>
-                )}
-              </div>
-            )}
+      {byDay.map(([day, dayMatches]) => (
+        <div key={day} className="pm-day-group">
+          <div className="pm-day-label">
+            {new Date(day + "T12:00:00Z").toLocaleDateString("es-ES", { weekday: "long", day: "numeric", month: "long" })}
           </div>
-        );
-      })}
+          {dayMatches.map(m => (
+            <div key={m.id} className="pm-result">
+              <div className="pm-result-side">
+                <TeamLogo src={m.home_logo} name={m.home_team} size={16} />{" "}{m.home_team}
+              </div>
+              <div className="pm-result-score">{m.home_goals}<span>–</span>{m.away_goals}</div>
+              <div className="pm-result-side pm-result-side-r">
+                {m.away_team}{" "}<TeamLogo src={m.away_logo} name={m.away_team} size={16} />
+              </div>
+            </div>
+          ))}
+        </div>
+      ))}
 
       <SectionTitle k="Pichichi" v="Máximos goleadores" />
       {scorers.length === 0
         ? <div className="pm-note">Aún no hay goleadores registrados.</div>
         : <ScorersList rows={scorers} />
       }
-
-      {/* Modal de viñeta ampliada */}
-      {enlarged && (
-        <div className="pm-overlay" onClick={() => setEnlarged(null)}>
-          <div className="pm-comic-modal" onClick={e => e.stopPropagation()}>
-            <div className="pm-modal-head">
-              <h3>Viñeta · {fmtDay(enlarged.day)}</h3>
-              <button className="pm-close" onClick={() => setEnlarged(null)}>✕</button>
-            </div>
-            <img src={enlarged.url} alt="Viñeta del grupo" style={{ width: "100%", borderRadius: 12 }} />
-          </div>
-        </div>
-      )}
     </div>
   );
 }
@@ -1808,9 +1819,13 @@ const CSS = `
 .pm-btn-comic:hover{background:rgba(255,255,255,.13);}
 .pm-note-loading{font-style:italic;}
 .pm-comic-err{font-size:11px;color:rgba(255,100,100,.85);cursor:pointer;padding:4px 0;}
-.pm-comic-thumb-btn{background:none;border:none;padding:0;cursor:pointer;display:flex;flex-direction:column;align-items:center;gap:5px;}
-.pm-comic-thumb{width:120px;height:120px;object-fit:cover;border-radius:10px;box-shadow:0 3px 12px rgba(0,0,0,.5);}
-.pm-comic-thumb-label{font-size:11px;color:var(--accent2);font-weight:600;}
+.pm-comic-section{margin-top:18px;display:flex;flex-direction:column;align-items:center;gap:6px;}
+.pm-comic-thumb-btn{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.1);border-radius:14px;padding:10px 14px;cursor:pointer;display:flex;align-items:center;gap:12px;width:100%;}
+.pm-comic-thumb-btn:hover{background:rgba(255,255,255,.08);}
+.pm-comic-thumb{width:64px;height:64px;object-fit:cover;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,.5);flex-shrink:0;}
+.pm-comic-thumb-meta{display:flex;flex-direction:column;gap:2px;text-align:left;}
+.pm-comic-thumb-label{font-size:13px;font-weight:700;color:var(--accent2);}
+.pm-comic-thumb-day{font-size:11px;opacity:.6;}
 .pm-comic-modal{width:100%;max-width:430px;background:var(--deep);border-radius:26px 26px 0 0;padding:18px 14px calc(30px + env(safe-area-inset-bottom));}
 
 /* ---- Recap / Crónica ---- */

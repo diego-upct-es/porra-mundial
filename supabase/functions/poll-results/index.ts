@@ -1,16 +1,12 @@
 /**
- * poll-results — Fase 5 + 6
+ * poll-results — Fase 5 + 6 + auto-comic
  *
- * En cada ejecución hace DOS llamadas a football-data.org:
- *   1. Resultados del día ± 1  →  actualiza matches (home_goals, away_goals, is_final)
- *   2. Goleadores del Mundial  →  actualiza player_stats (ext_player_id, goals, team_logo…)
- *
- * Usa el mismo token FOOTBALL_DATA_TOKEN y el mismo cron (cada 30 min).
- * Los goleadores se actualizan en el plan gratuito; assists viene null y se ignora.
- *
- * Invocación manual:
- *   curl -X POST https://<project-ref>.supabase.co/functions/v1/poll-results \
- *        -H "Authorization: Bearer <anon-key>"
+ * Cada 30 min:
+ *   1. Actualiza resultados del día ± 1 desde football-data.org
+ *   2. Actualiza goleadores
+ *   3. Detecta si alguna jornada acaba de quedar completa (todos is_final)
+ *      y, si no existe viñeta para ese día, dispara comic-gen en paralelo
+ *      para cada liga activa.
  */
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
@@ -29,13 +25,12 @@ Deno.serve(async (req: Request) => {
       );
     }
 
-    // Service role: bypasa RLS → puede escribir en matches y player_stats
     const supabase = createClient(
       Deno.env.get("SUPABASE_URL")!,
       Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
     );
 
-    // ── LLAMADA 1: Resultados del día ± 1 ────────────────────
+    // ── LLAMADA 1: Resultados del día ± 1 ────────────────────────
     const now       = new Date();
     const yesterday = new Date(now); yesterday.setUTCDate(yesterday.getUTCDate() - 1);
     const tomorrow  = new Date(now); tomorrow.setUTCDate(tomorrow.getUTCDate() + 1);
@@ -50,21 +45,32 @@ Deno.serve(async (req: Request) => {
     );
 
     let matchesResult: Record<string, unknown> = { window: { dateFrom, dateTo } };
+    // Días recién completados en esta ejecución (todos sus partidos is_final)
+    const newlyFinishedDays: string[] = [];
 
     if (!matchRes.ok) {
       const body = await matchRes.text();
       matchesResult = { error: `HTTP ${matchRes.status}: ${body}` };
       console.error("[matches] Error:", matchesResult.error);
     } else {
-      const json: any        = await matchRes.json();
-      const matches: any[]   = json.matches ?? [];
+      const json: any      = await matchRes.json();
+      const matches: any[] = json.matches ?? [];
       let updated = 0, errors = 0;
       const finished: string[] = [];
 
+      // Agrupa partidos de la ventana por día (para detectar jornadas completas)
+      const byDay: Record<string, { total: number; finalCount: number }> = {};
+
       for (const m of matches) {
+        const day       = (m.utcDate as string).slice(0, 10);
         const homeGoals = m.score?.fullTime?.home ?? null;
         const awayGoals = m.score?.fullTime?.away ?? null;
         const isFinal   = m.status === "FINISHED";
+
+        // Acumular stats por día
+        if (!byDay[day]) byDay[day] = { total: 0, finalCount: 0 };
+        byDay[day].total++;
+        if (isFinal) byDay[day].finalCount++;
 
         const { error } = await supabase
           .from("matches")
@@ -85,11 +91,19 @@ Deno.serve(async (req: Request) => {
         }
       }
 
+      // Detectar días en la ventana donde TODOS los partidos ya son finales
+      for (const [day, { total, finalCount }] of Object.entries(byDay)) {
+        if (total > 0 && total === finalCount) {
+          newlyFinishedDays.push(day);
+          console.log(`[matches] Jornada ${day} completada: ${total}/${total} partidos finales.`);
+        }
+      }
+
       console.log(`[matches] ${updated} actualizados, ${errors} errores.`);
       matchesResult = { window: { dateFrom, dateTo }, in_window: matches.length, updated, errors, finished };
     }
 
-    // ── LLAMADA 2: Goleadores del Mundial ─────────────────────
+    // ── LLAMADA 2: Goleadores del Mundial ─────────────────────────
     console.log("[scorers] Consultando máximos goleadores…");
 
     let scorersResult: Record<string, unknown> = {};
@@ -115,11 +129,10 @@ Deno.serve(async (req: Request) => {
           team:          s.team?.name   ?? "",
           team_logo:     s.team?.crest  ?? null,
           goals:         s.goals ?? 0,
-          assists:       0,  // null en plan gratuito — forzamos 0
+          assists:       0,
           updated_at:    now.toISOString(),
         })).filter((r: any) => r.ext_player_id !== null);
 
-        // Upsert por ext_player_id (columna UNIQUE)
         const { error } = await supabase
           .from("player_stats")
           .upsert(rows, { onConflict: "ext_player_id" });
@@ -132,15 +145,94 @@ Deno.serve(async (req: Request) => {
         scorersResult = { upserted: 0, message: "Sin goleadores todavía." };
       }
     } catch (scorerErr: any) {
-      // Un error en goleadores no cancela la respuesta principal
       console.error("[scorers] Error:", scorerErr.message);
       scorersResult = { error: scorerErr.message };
+    }
+
+    // ── LLAMADA 3: Auto-generación de viñetas ─────────────────────
+    let comicsResult: Record<string, unknown> = { triggered: 0 };
+
+    if (newlyFinishedDays.length > 0) {
+      const geminiKey = Deno.env.get("GEMINI_API_KEY") ?? "";
+      if (!geminiKey) {
+        console.log("[comics] GEMINI_API_KEY no configurado, saltando auto-comic.");
+        comicsResult = { skipped: "GEMINI_API_KEY no configurado" };
+      } else {
+        // Ligas activas (con miembros)
+        const { data: leagues } = await supabase
+          .from("leagues")
+          .select("id, name");
+
+        const leagueList: { id: string; name: string }[] = leagues ?? [];
+
+        // Para cada par (liga, día recién terminado), verificar si ya hay viñeta
+        const pending: { league_id: string; league_name: string; match_day: string }[] = [];
+
+        for (const day of newlyFinishedDays) {
+          const { data: existingComics } = await supabase
+            .from("daily_comics")
+            .select("league_id")
+            .eq("match_day", day)
+            .in("league_id", leagueList.map(l => l.id));
+
+          const alreadyDone = new Set((existingComics ?? []).map((c: any) => c.league_id));
+
+          for (const lg of leagueList) {
+            if (!alreadyDone.has(lg.id)) {
+              pending.push({ league_id: lg.id, league_name: lg.name, match_day: day });
+            }
+          }
+        }
+
+        if (pending.length === 0) {
+          console.log("[comics] Todas las viñetas ya existen. Nada que generar.");
+          comicsResult = { triggered: 0, message: "Viñetas ya existentes." };
+        } else {
+          console.log(`[comics] Disparando ${pending.length} viñeta(s): ${pending.map(p => `${p.league_name}/${p.match_day}`).join(", ")}`);
+
+          const comicGenUrl = `${Deno.env.get("SUPABASE_URL")}/functions/v1/comic-gen`;
+          const serviceKey  = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+
+          // Lanzar en paralelo (fire-and-await: es un job nocturno, el tiempo no importa)
+          const comicResults = await Promise.allSettled(
+            pending.map(async ({ league_id, league_name, match_day }) => {
+              try {
+                const res  = await fetch(comicGenUrl, {
+                  method:  "POST",
+                  headers: {
+                    "Content-Type":  "application/json",
+                    "Authorization": `Bearer ${serviceKey}`,
+                  },
+                  body: JSON.stringify({ league_id, match_day }),
+                });
+                const json = await res.json();
+                if (json.ok) {
+                  console.log(`[comics] ✓ ${league_name}/${match_day}: ${json.url?.slice(-30)}`);
+                } else if (json.cached) {
+                  console.log(`[comics] cached ${league_name}/${match_day}`);
+                } else {
+                  console.warn(`[comics] ✗ ${league_name}/${match_day}: ${json.error}`);
+                }
+                return json;
+              } catch (e: any) {
+                console.error(`[comics] fetch error ${league_name}/${match_day}:`, e.message);
+                return { ok: false, error: e.message };
+              }
+            })
+          );
+
+          const ok  = comicResults.filter(r => r.status === "fulfilled" && (r.value as any)?.ok).length;
+          const err = comicResults.length - ok;
+          comicsResult = { triggered: comicResults.length, ok, errors: err };
+        }
+      }
     }
 
     return respond({
       ok:      true,
       matches: matchesResult,
       scorers: scorersResult,
+      comics:  comicsResult,
     });
 
   } catch (err: any) {
