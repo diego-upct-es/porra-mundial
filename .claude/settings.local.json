@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm install:*)",
+      "Bash(npx vite build:*)",
+      "Bash(npx supabase:*)",
+      "Bash(curl:*)",
+      "Bash(python3:*)",
+      "Bash(npm run build:*)"
+    ]
+  }
+}
