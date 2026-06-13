@@ -707,6 +707,7 @@ function LeagueView({ league, theme, tab, setTab, onBack, upsertPrediction, setC
         {tab === "clasificacion" && <StandingsTab   league={league} />}
         {tab === "resultados"    && <ResultsTab />}
         {tab === "historico"     && <HistoryTab />}
+        {tab === "cronica"       && <RecapTab       league={league} />}
       </div>
 
       <nav className="pm-nav">
@@ -715,6 +716,7 @@ function LeagueView({ league, theme, tab, setTab, onBack, upsertPrediction, setC
           ["clasificacion", "Clasif.",    "≣"],
           ["resultados",    "Resultados", "⚽"],
           ["historico",     "Histórico",  "↺"],
+          ["cronica",       "Crónica",    "🗞"],
         ].map(([key, label, icon]) => (
           <button key={key} className={"pm-navbtn" + (tab === key ? " is-active" : "")} onClick={() => setTab(key)}>
             <span className="pm-navicon">{icon}</span>
@@ -1138,6 +1140,43 @@ function HistoryTab() {
           </div>
         );
       })}
+    </div>
+  );
+}
+
+/* ─── Crónica diaria ────────────────────────────────────── */
+function RecapTab({ league }) {
+  const [recaps, setRecaps]   = useState([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    setLoading(true);
+    supabase
+      .from("daily_recaps")
+      .select("recap_date, content, created_at")
+      .eq("league_id", league.id)
+      .order("recap_date", { ascending: false })
+      .limit(7)
+      .then(({ data }) => { setRecaps(data || []); setLoading(false); });
+  }, [league.id]);
+
+  return (
+    <div className="pm-pad">
+      <SectionTitle k="Crónica" v="Resumen diario por IA" />
+      {loading && <div className="pm-note">Cargando crónicas…</div>}
+      {!loading && recaps.length === 0 && (
+        <div className="pm-note">
+          Aún no hay crónicas. Se generan automáticamente al finalizar los partidos del día.
+        </div>
+      )}
+      {recaps.map(r => (
+        <div key={r.recap_date} className="pm-recap">
+          <div className="pm-recap-date">
+            {new Date(r.recap_date).toLocaleDateString("es-ES", { weekday: "long", day: "numeric", month: "long" })}
+          </div>
+          <div className="pm-recap-content">{r.content}</div>
+        </div>
+      ))}
     </div>
   );
 }
@@ -1597,6 +1636,11 @@ const CSS = `
 .pm-pts-3{background:#1f9e57;color:#fff;}
 .pm-pts-1{background:var(--accent2);color:#161122;}
 .pm-pts-0{background:rgba(255,255,255,.1);color:rgba(255,255,255,.6);}
+
+/* ---- Recap / Crónica ---- */
+.pm-recap{background:rgba(255,255,255,.05);border-radius:14px;padding:14px 16px;margin-bottom:14px;}
+.pm-recap-date{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--accent2);margin-bottom:8px;}
+.pm-recap-content{font-size:14px;line-height:1.6;white-space:pre-wrap;color:rgba(255,255,255,.85);}
 
 /* ---- Modals ---- */
 .pm-overlay{position:fixed;inset:0;background:rgba(0,0,0,.6);display:flex;align-items:flex-end;justify-content:center;z-index:50;}

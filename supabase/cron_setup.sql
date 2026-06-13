@@ -148,3 +148,39 @@ SELECT cron.schedule(
 
 -- Eliminar:
 -- SELECT cron.unschedule('drama-push-30min');
+
+
+-- =============================================================
+-- FEAT: Daily roast — crónica diaria con Gemini a las 23:30 UTC
+-- =============================================================
+
+SELECT cron.schedule(
+  'daily-roast-2330',
+  '30 23 * * *',                   -- 23:30 UTC = 01:30 CEST
+  $$
+    SELECT net.http_post(
+      url     := 'https://eflomqqolasqiixbsnbf.supabase.co/functions/v1/daily-roast',
+      headers := jsonb_build_object(
+        'Content-Type',  'application/json',
+        'Authorization', 'Bearer sb_publishable_KWbMr9Rf252tBegwQTa3lg_iy0J9TSh'
+      ),
+      body    := '{}'::jsonb
+    );
+  $$
+);
+
+-- Verificar:
+-- SELECT jobid, jobname, schedule FROM cron.job WHERE jobname = 'daily-roast-2330';
+
+-- Ejecutar manualmente:
+-- SELECT net.http_post(
+--   url     := 'https://eflomqqolasqiixbsnbf.supabase.co/functions/v1/daily-roast',
+--   headers := jsonb_build_object(
+--     'Content-Type',  'application/json',
+--     'Authorization', 'Bearer sb_publishable_KWbMr9Rf252tBegwQTa3lg_iy0J9TSh'
+--   ),
+--   body    := '{}'::jsonb
+-- );
+
+-- Eliminar:
+-- SELECT cron.unschedule('daily-roast-2330');
