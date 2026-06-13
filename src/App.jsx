@@ -118,6 +118,39 @@ function calcDailySweeps(predictions, matchById, userId) {
   return { sweeps, bonus: sweeps * 3 };
 }
 
+/**
+ * Asigna un mote estilo Twitter Fútbol (humor negro) según rendimiento.
+ * Devuelve { emoji, label, title } o null si no hay datos suficientes.
+ */
+function getUserBadge(predictions, matchById, userId) {
+  const preds = predictions.filter(p => p.user_id === userId);
+  const finished = preds.filter(p => {
+    const m = matchById[p.match_id];
+    return m && m.is_final;
+  });
+  if (finished.length < 3) return null; // sin datos suficientes
+
+  const exacts   = finished.filter(p => scorePrediction(p, matchById[p.match_id]) === 3).length;
+  const partials = finished.filter(p => scorePrediction(p, matchById[p.match_id]) === 1).length;
+  const zeros    = finished.filter(p => scorePrediction(p, matchById[p.match_id]) === 0).length;
+  const pctExact = exacts / finished.length;
+  const pctZero  = zeros / finished.length;
+
+  if (pctExact >= 0.5)  return { emoji: "🎯", label: "Oráculo",       title: "Acierta la mitad o más con marcador exacto. Inquietante." };
+  if (pctExact >= 0.3)  return { emoji: "🧙", label: "Vidente",       title: "No sabe cómo lo hace. Él tampoco." };
+  if (pctExact >= 0.15 && partials >= 3)
+                        return { emoji: "📊", label: "Analista",       title: "Tiene los datos. Los datos no le tienen a él." };
+  if (pctZero >= 0.6)   return { emoji: "💀", label: "El Gafe",        title: "Cuando predice, el balón huye." };
+  if (pctZero >= 0.45)  return { emoji: "🪦", label: "Elogio Fúnebre", title: "Sus predicciones son un requiem en dos goles." };
+  if (zeros >= 5 && exacts === 0)
+                        return { emoji: "🤡", label: "El Regalito",    title: "Dona puntos sin querer. Generoso él." };
+  if (exacts >= 2 && zeros > exacts * 2)
+                        return { emoji: "🎲", label: "Ruleta Rusa",    title: "O clava el marcador o ni se acerca. Sin término medio." };
+  if (partials > exacts + zeros)
+                        return { emoji: "🤝", label: "Empate Moral",   title: "Siempre cerca pero nunca dentro. Filosofía de vida." };
+  return { emoji: "👻", label: "Fantasma",       title: "Predice. Está entre nosotros. No puntúa." };
+}
+
 /** Genera un código de invitación a partir del nombre de la liga. */
 function generateLeagueCode(name) {
   const base = name.replace(/[^a-zA-Z0-9]/g, "").slice(0, 4).toUpperCase().padEnd(4, "X");
@@ -911,7 +944,8 @@ function StandingsTab({ league }) {
     return league.members
       .map(u => {
         const { sweeps, bonus } = calcDailySweeps(leaguePredictions, matchById, u);
-        const base = totalPoints(leaguePredictions, matchById, u, phase);
+        const base  = totalPoints(leaguePredictions, matchById, u, phase);
+        const badge = getUserBadge(leaguePredictions, matchById, u);
         return {
           u,
           name:   profiles[u]?.name || u.slice(0, 8),
@@ -919,6 +953,7 @@ function StandingsTab({ league }) {
           base,
           exacts: countExacts(leaguePredictions, matchById, u, phase),
           sweeps,
+          badge,
         };
       })
       .sort((x, y) => y.pts - x.pts || y.exacts - x.exacts);
@@ -951,6 +986,11 @@ function StandingsTab({ league }) {
               {r.sweeps > 0 && phase === "general" && (
                 <span className="pm-sweep-badge" title={`${r.sweeps} pleno${r.sweeps > 1 ? "s" : ""} del día (+${r.sweeps * 3} pts)`}>
                   🔥{r.sweeps}
+                </span>
+              )}
+              {r.badge && (
+                <span className="pm-badge" title={r.badge.title}>
+                  {r.badge.emoji} {r.badge.label}
                 </span>
               )}
             </div>
@@ -1530,6 +1570,7 @@ const CSS = `
 .pm-rowname{flex:1;font-size:15px;font-weight:600;display:flex;align-items:center;gap:7px;}
 .pm-tu{font-size:9px;background:var(--accent);color:#161122;padding:2px 6px;border-radius:10px;font-weight:700;text-transform:uppercase;}
 .pm-sweep-badge{font-size:11px;margin-left:5px;background:rgba(255,160,0,.18);color:#ffb300;padding:1px 5px;border-radius:8px;font-weight:700;cursor:default;}
+.pm-badge{font-size:10px;margin-left:5px;background:rgba(255,255,255,.08);color:rgba(255,255,255,.65);padding:1px 6px;border-radius:8px;font-weight:600;cursor:default;white-space:nowrap;}
 .pm-rowexact{font-size:11px;opacity:.55;}
 .pm-rowpts{font-size:20px;font-weight:700;font-family:'Fredoka';min-width:34px;text-align:right;}
 
