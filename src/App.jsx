@@ -415,6 +415,17 @@ export default function App() {
     }
   }
 
+  // Borra la liga. Solo funciona si auth.uid() === admin_id (validado en DB).
+  async function deleteLeague(lgId) {
+    const { data, error } = await supabase.rpc('delete_league', { _league_id: lgId });
+    if (error) return 'error';
+    if (data?.error) return data.error;
+    setLeagues(prev => prev.filter(l => l.id !== lgId));
+    setLeagueId(null);
+    setView('home');
+    return 'ok';
+  }
+
   // El campeón se guarda directamente en league_members.
   async function setChampion(teamCode) {
     const uid = session?.user.id;
@@ -498,6 +509,7 @@ export default function App() {
               upsertPrediction={upsertPrediction}
               setChampion={setChampion}
               updateMatch={updateMatch}
+              deleteLeague={deleteLeague}
             />
           )}
         </div>
@@ -604,7 +616,7 @@ function LeaguesHome({ leagues, loading, onOpen, onCreate, onJoin, onSignOut, pu
 }
 
 /* ─── Vista de liga ───────────────────────────────────────── */
-function LeagueView({ league, theme, tab, setTab, onBack, upsertPrediction, setChampion, updateMatch }) {
+function LeagueView({ league, theme, tab, setTab, onBack, upsertPrediction, setChampion, updateMatch, deleteLeague }) {
   const { userId, myPredictions, matchById } = useUser();
   const myLeaguePreds = myPredictions.filter(p => p.league_id === league.id);
   const myPts = totalPoints(myLeaguePreds, matchById, userId);
@@ -657,6 +669,8 @@ function LeagueView({ league, theme, tab, setTab, onBack, upsertPrediction, setC
         <AdminModal
           onClose={() => setAdminOpen(false)}
           onUpdate={updateMatch}
+          onDelete={() => deleteLeague(league.id)}
+          leagueName={league.name}
         />
       )}
     </div>
@@ -1137,7 +1151,7 @@ function JoinModal({ onClose, onJoin }) {
 }
 
 /* ─── Modal de override de admin ─────────────────────────── */
-function AdminModal({ onClose, onUpdate }) {
+function AdminModal({ onClose, onUpdate, onDelete, leagueName }) {
   const { matches } = useUser();
 
   // Partidos ordenados: primero los iniciados (locked/finished), después los próximos
@@ -1154,6 +1168,7 @@ function AdminModal({ onClose, onUpdate }) {
   const [isFinal,   setIsFinal]   = useState(false);
   const [saving,    setSaving]    = useState(false);
   const [feedback,  setFeedback]  = useState(null); // { ok: bool, msg: string }
+  const [delStep,   setDelStep]   = useState(0);    // 0 = oculto, 1 = confirmar, 2 = borrando
 
   const selected = matches.find(m => m.id === matchId);
 
@@ -1255,6 +1270,41 @@ function AdminModal({ onClose, onUpdate }) {
       >
         {saving ? "Guardando…" : "Actualizar resultado"}
       </button>
+
+      {/* ── Zona peligrosa: borrar liga ── */}
+      <div className="pm-danger-zone">
+        <div className="pm-danger-title">Zona peligrosa</div>
+        {delStep === 0 && (
+          <button className="pm-btn pm-btn-danger" onClick={() => setDelStep(1)}>
+            Borrar liga…
+          </button>
+        )}
+        {delStep === 1 && (
+          <div>
+            <div className="pm-danger-warn">
+              Esto borra <strong>{leagueName}</strong>, todos sus miembros y todas sus predicciones. Sin vuelta atrás.
+            </div>
+            <div style={{ display: 'flex', gap: 8, marginTop: 10 }}>
+              <button className="pm-btn pm-btn-ghost" style={{ flex: 1 }} onClick={() => setDelStep(0)}>
+                Cancelar
+              </button>
+              <button
+                className="pm-btn pm-btn-danger"
+                style={{ flex: 1 }}
+                onClick={async () => {
+                  setDelStep(2);
+                  const r = await onDelete();
+                  if (r !== 'ok') { setDelStep(1); setFeedback({ ok: false, msg: 'Error al borrar la liga.' }); }
+                  // Si ok: App navega a home automáticamente, el modal desaparece
+                }}
+              >
+                Sí, borrar para siempre
+              </button>
+            </div>
+          </div>
+        )}
+        {delStep === 2 && <div className="pm-note" style={{ textAlign: 'center' }}>Borrando…</div>}
+      </div>
     </Modal>
   );
 }
@@ -1481,6 +1531,11 @@ const CSS = `
 .pm-theme-dot{width:46px;height:46px;border-radius:50%;border:3px solid transparent;cursor:pointer;}
 .pm-theme-dot.is-on{border-color:#fff;transform:scale(1.08);}
 
+.pm-btn-danger{background:rgba(200,30,30,.25);border:1.5px solid rgba(255,80,80,.5);color:#ff9a9a;font-weight:700;}
+.pm-btn-danger:hover{background:rgba(200,30,30,.4);}
+.pm-danger-zone{margin-top:22px;border-top:1px solid rgba(255,255,255,.08);padding-top:16px;}
+.pm-danger-title{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:1.5px;opacity:.4;margin-bottom:10px;}
+.pm-danger-warn{font-size:13px;background:rgba(200,30,30,.15);border:1px solid rgba(255,80,80,.3);color:#ffbaba;border-radius:12px;padding:11px 13px;}
 button:focus-visible,input:focus-visible{outline:2px solid #fff;outline-offset:2px;}
 @media (prefers-reduced-motion: reduce){*{animation:none!important;transition:none!important;}}
 
