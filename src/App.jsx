@@ -752,7 +752,7 @@ function LeagueView({ league, theme, tab, setTab, onBack, upsertPrediction, setC
         {tab === "prediccion"    && <PredictionTab  league={league} upsertPrediction={upsertPrediction} setChampion={setChampion} />}
         {tab === "clasificacion" && <StandingsTab   league={league} />}
         {tab === "resultados"    && <ResultsTab />}
-        {tab === "historico"     && <HistoryTab />}
+        {tab === "historico"     && <HistoryTab league={league} />}
         {tab === "cronica"       && <RecapTab       league={league} />}
       </div>
 
@@ -785,9 +785,10 @@ function LeagueView({ league, theme, tab, setTab, onBack, upsertPrediction, setC
 
 /* ─── Predicción ─────────────────────────────────────────── */
 function PredictionTab({ league, upsertPrediction, setChampion }) {
-  const { matches } = useUser();
-  const open = matches.filter(m => getMatchState(m) === "open");
-  const soon = matches.filter(m => getMatchState(m) === "soon");
+  const { matches, leaguePredictions, userId } = useUser();
+  const open   = matches.filter(m => getMatchState(m) === "open");
+  const locked = matches.filter(m => getMatchState(m) === "locked");
+  const soon   = matches.filter(m => getMatchState(m) === "soon");
 
   return (
     <div className="pm-pad">
@@ -799,6 +800,35 @@ function PredictionTab({ league, upsertPrediction, setChampion }) {
       {open.map(m => (
         <Scoreboard key={m.id} match={m} upsertPrediction={upsertPrediction} />
       ))}
+
+      {locked.length > 0 && (
+        <>
+          <SectionTitle k="En juego" v="Predicción cerrada" />
+          {locked.map(m => {
+            const myPred = leaguePredictions.find(p => p.match_id === m.id && p.user_id === userId);
+            return (
+              <div key={m.id} className="pm-locked-match">
+                <div className="pm-locked-meta">{formatKickoff(m.kickoff)}</div>
+                <div className="pm-locked-teams">
+                  <TeamLogo src={m.home_logo} name={m.home_team} size={15} />
+                  {m.home_team}
+                  <span className="pm-locked-vs">vs</span>
+                  {m.away_team}
+                  <TeamLogo src={m.away_logo} name={m.away_team} size={15} />
+                </div>
+                <div className="pm-locked-pred">
+                  {myPred
+                    ? <><span className="pm-locked-label">Tu predicción:</span><strong>{myPred.home_goals}–{myPred.away_goals}</strong></>
+                    : <span className="pm-locked-absent">Sin predicción</span>
+                  }
+                  <span className="pm-locked-icon">🔒</span>
+                </div>
+              </div>
+            );
+          })}
+        </>
+      )}
+
       <SectionTitle k="Próximamente" v="Se abrirán el día anterior" />
       {soon.slice(0, 8).map(m => (
         <div key={m.id} className="pm-soon">
@@ -817,7 +847,9 @@ function PredictionTab({ league, upsertPrediction, setChampion }) {
 function ChampionCard({ league, setChampion }) {
   const { userId, matches } = useUser();
   const mine = league.champion[userId];
-  const [search, setSearch] = useState('');
+  const [search,   setSearch]   = useState('');
+  const [pending,  setPending]  = useState(null); // team awaiting confirmation
+  const [saving,   setSaving]   = useState(false);
 
   // Lista de equipos únicos extraída de los partidos reales, ordenada alfabéticamente
   const teams = useMemo(() => {
@@ -835,18 +867,52 @@ function ChampionCard({ league, setChampion }) {
   const q = search.trim().toLowerCase();
   const filtered = q ? teams.filter(t => t.name.toLowerCase().includes(q)) : teams;
 
+  async function handleConfirm() {
+    if (!pending || saving) return;
+    setSaving(true);
+    await setChampion(pending.name);
+    setSaving(false);
+    setPending(null);
+  }
+
   return (
     <div className="pm-champ">
       <div className="pm-champ-head">
         <span className="pm-trophy">🏆</span> Campeón del Mundial <em>+5 pts</em>
       </div>
       {mine ? (
+        // Elegido y bloqueado — no se puede cambiar
         <div className="pm-champ-current">
           <TeamLogo src={myTeam?.logo} name={mine} size={22} />
           <span className="pm-champ-current-name">{mine}</span>
-          <button className="pm-champ-change" onClick={() => setChampion(null)}>cambiar</button>
+          <span className="pm-champ-locked" title="Ya no puedes cambiar tu elección">🔒 Fijo</span>
+        </div>
+      ) : pending ? (
+        // Diálogo de confirmación antes de fijar
+        <div className="pm-champ-confirm">
+          <div className="pm-champ-confirm-team">
+            <TeamLogo src={pending.logo} name={pending.name} size={22} />
+            <strong>{pending.name}</strong>
+          </div>
+          <div className="pm-champ-confirm-warn">
+            ¿Seguro? No podrás cambiarlo después.
+          </div>
+          <div className="pm-champ-confirm-btns">
+            <button className="pm-btn pm-btn-ghost" style={{ flex: 1, padding: '10px' }} onClick={() => setPending(null)}>
+              Cancelar
+            </button>
+            <button
+              className="pm-btn pm-btn-primary"
+              style={{ flex: 1, padding: '10px' }}
+              disabled={saving}
+              onClick={handleConfirm}
+            >
+              {saving ? 'Guardando…' : 'Sí, lo elijo'}
+            </button>
+          </div>
         </div>
       ) : (
+        // Selector de equipo
         <>
           <input
             className="pm-input pm-champ-search"
@@ -859,7 +925,7 @@ function ChampionCard({ league, setChampion }) {
               <div className="pm-note" style={{ padding: '8px 0' }}>Sin resultados.</div>
             )}
             {filtered.map(t => (
-              <button key={t.name} className="pm-champ-opt" onClick={() => setChampion(t.name)}>
+              <button key={t.name} className="pm-champ-opt" onClick={() => { setSearch(''); setPending(t); }}>
                 <TeamLogo src={t.logo} name={t.name} size={16} />{t.name}
               </button>
             ))}
@@ -1260,7 +1326,7 @@ function ScorersList({ rows }) {
 }
 
 /* ─── Histórico ──────────────────────────────────────────── */
-function HistoryTab() {
+function HistoryTab({ league }) {
   const { userId, profiles, matchById, leaguePredictions } = useUser();
 
   // Partidos iniciados (locked o finished), más recientes primero
@@ -1276,16 +1342,27 @@ function HistoryTab() {
         <div className="pm-note">Aún no ha comenzado ningún partido.</div>
       )}
       {revealable.map(m => {
-        const preds = leaguePredictions
+        // Índice predicciones por usuario para este partido
+        const predByUser = {};
+        leaguePredictions
           .filter(p => p.match_id === m.id)
-          .map(p => ({
-            ...p,
-            displayName: profiles[p.user_id]?.name || p.user_id.slice(0, 8),
-            pts: scorePrediction(p, m),
-          }))
-          .sort((x, y) => (y.pts ?? -1) - (x.pts ?? -1));
+          .forEach(p => { predByUser[p.user_id] = p; });
 
-        if (preds.length === 0) return null;
+        // Todos los miembros de la liga — con o sin predicción
+        const rows = league.members.map(uid => {
+          const p = predByUser[uid];
+          return {
+            uid,
+            displayName: profiles[uid]?.name || uid.slice(0, 8),
+            pred: p || null,
+            pts:  p ? scorePrediction(p, m) : null,
+          };
+        }).sort((x, y) => {
+          // Con predicción primero; entre ellos, más puntos arriba; sin predicción al final
+          if (x.pred && !y.pred) return -1;
+          if (!x.pred && y.pred) return 1;
+          return (y.pts ?? -1) - (x.pts ?? -1);
+        });
 
         return (
           <div key={m.id} className="pm-hist">
@@ -1296,14 +1373,20 @@ function HistoryTab() {
                 {m.away_team}
               </span>
             </div>
-            {preds.map(p => (
-              <div key={p.user_id} className="pm-hist-row">
+            {rows.map(r => (
+              <div key={r.uid} className={"pm-hist-row" + (!r.pred ? " pm-hist-row-absent" : "")}>
                 <span className="pm-hist-name">
-                  {p.displayName}{p.user_id === userId && <span className="pm-tu">tú</span>}
+                  {r.displayName}{r.uid === userId && <span className="pm-tu">tú</span>}
                 </span>
-                <span className="pm-hist-pred">{p.home_goals}–{p.away_goals}</span>
-                {m.is_final && p.pts !== null && (
-                  <span className={"pm-hist-pts pm-pts-" + p.pts}>+{p.pts}</span>
+                {r.pred ? (
+                  <>
+                    <span className="pm-hist-pred">{r.pred.home_goals}–{r.pred.away_goals}</span>
+                    {m.is_final && r.pts !== null && (
+                      <span className={"pm-hist-pts pm-pts-" + r.pts}>+{r.pts}</span>
+                    )}
+                  </>
+                ) : (
+                  <span className="pm-hist-absent">—</span>
                 )}
               </div>
             ))}
@@ -1735,7 +1818,11 @@ const CSS = `
 .pm-champ-opt:hover{background:rgba(255,255,255,.13);}
 .pm-champ-current{display:flex;align-items:center;gap:10px;background:rgba(255,255,255,.1);border-radius:14px;padding:12px 14px;margin:6px 0;}
 .pm-champ-current-name{flex:1;font-size:15px;font-weight:600;}
-.pm-champ-change{font-size:12px;background:none;border:1px solid rgba(255,255,255,.3);color:rgba(255,255,255,.8);border-radius:10px;padding:5px 10px;cursor:pointer;}
+.pm-champ-locked{font-size:11px;background:rgba(255,255,255,.08);color:rgba(255,255,255,.5);border-radius:10px;padding:4px 9px;font-weight:600;white-space:nowrap;}
+.pm-champ-confirm{background:rgba(255,160,0,.1);border:1px solid rgba(255,160,0,.25);border-radius:14px;padding:14px;margin:6px 0;display:flex;flex-direction:column;gap:10px;}
+.pm-champ-confirm-team{display:flex;align-items:center;gap:9px;font-size:15px;font-weight:700;}
+.pm-champ-confirm-warn{font-size:12px;color:rgba(255,200,100,.85);}
+.pm-champ-confirm-btns{display:flex;gap:8px;}
 
 /* ---- Scoreboard ---- */
 .pm-board{background:#100f28;border:2px solid rgba(255,255,255,.07);border-radius:24px;padding:16px 14px 14px;margin-bottom:14px;box-shadow:0 8px 0 rgba(0,0,0,.35);}
@@ -1767,6 +1854,17 @@ const CSS = `
 .pm-soon-teams{font-size:14px;font-weight:600;display:flex;align-items:center;gap:5px;flex-wrap:wrap;}
 .pm-soon-teams span{opacity:.4;margin:0 3px;font-size:12px;}
 .pm-soon-when{font-size:11px;opacity:.55;margin-top:3px;}
+
+/* ---- Partidos bloqueados (en juego, predicción cerrada) ---- */
+.pm-locked-match{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);border-radius:16px;padding:11px 14px;margin-bottom:9px;}
+.pm-locked-meta{font-size:10px;letter-spacing:1px;text-transform:uppercase;opacity:.5;font-weight:600;margin-bottom:5px;}
+.pm-locked-teams{font-size:13px;font-weight:600;display:flex;align-items:center;gap:5px;flex-wrap:wrap;opacity:.75;}
+.pm-locked-vs{opacity:.4;font-size:11px;margin:0 2px;}
+.pm-locked-pred{display:flex;align-items:center;gap:6px;margin-top:7px;font-size:12px;}
+.pm-locked-label{opacity:.55;}
+.pm-locked-pred strong{font-family:'Fredoka';font-size:16px;color:var(--accent2);}
+.pm-locked-absent{opacity:.4;font-style:italic;}
+.pm-locked-icon{margin-left:auto;font-size:13px;opacity:.4;}
 
 /* ---- Standings ---- */
 .pm-seg{display:flex;gap:6px;background:rgba(0,0,0,.25);padding:5px;border-radius:16px;margin-bottom:14px;}
@@ -1806,6 +1904,8 @@ const CSS = `
 .pm-pts-3{background:#1f9e57;color:#fff;}
 .pm-pts-1{background:var(--accent2);color:#161122;}
 .pm-pts-0{background:rgba(255,255,255,.1);color:rgba(255,255,255,.6);}
+.pm-hist-row-absent{opacity:.45;}
+.pm-hist-absent{font-size:16px;font-weight:700;font-family:'Fredoka';color:rgba(255,255,255,.35);}
 
 /* ---- Avatar propio (home screen) ---- */
 .pm-avatar-btn{display:inline-flex;align-items:center;justify-content:center;width:32px;height:32px;border-radius:50%;background:rgba(255,255,255,.12);cursor:pointer;font-size:16px;overflow:hidden;flex-shrink:0;border:1.5px solid rgba(255,255,255,.2);}
