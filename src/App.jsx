@@ -93,6 +93,31 @@ function countExacts(predictions, matchById, userId, phase = "general") {
   }, 0);
 }
 
+/**
+ * Días en los que userId acertó TODOS los marcadores exactos (≥1 partido finalizado).
+ * Devuelve { bonus: number, sweeps: number }.
+ * Solo se aplica en vista "general" (no filtra por fase).
+ */
+function calcDailySweeps(predictions, matchById, userId) {
+  // Agrupa partidos finalizados por día UTC (YYYY-MM-DD)
+  const byDay = {};
+  Object.values(matchById).forEach(m => {
+    if (!m.is_final || m.home_goals === null) return;
+    const day = m.kickoff.slice(0, 10);
+    (byDay[day] = byDay[day] || []).push(m);
+  });
+
+  let sweeps = 0;
+  for (const dayMatches of Object.values(byDay)) {
+    const allExact = dayMatches.every(m => {
+      const p = predictions.find(pp => pp.match_id === m.id && pp.user_id === userId);
+      return p && p.home_goals === m.home_goals && p.away_goals === m.away_goals;
+    });
+    if (allExact) sweeps++;
+  }
+  return { sweeps, bonus: sweeps * 3 };
+}
+
 /** Genera un código de invitación a partir del nombre de la liga. */
 function generateLeagueCode(name) {
   const base = name.replace(/[^a-zA-Z0-9]/g, "").slice(0, 4).toUpperCase().padEnd(4, "X");
@@ -884,12 +909,18 @@ function StandingsTab({ league }) {
 
   const rows = useMemo(() => {
     return league.members
-      .map(u => ({
-        u,
-        name:   profiles[u]?.name || u.slice(0, 8),
-        pts:    totalPoints(leaguePredictions, matchById, u, phase),
-        exacts: countExacts(leaguePredictions, matchById, u, phase),
-      }))
+      .map(u => {
+        const { sweeps, bonus } = calcDailySweeps(leaguePredictions, matchById, u);
+        const base = totalPoints(leaguePredictions, matchById, u, phase);
+        return {
+          u,
+          name:   profiles[u]?.name || u.slice(0, 8),
+          pts:    base + (phase === "general" ? bonus : 0),
+          base,
+          exacts: countExacts(leaguePredictions, matchById, u, phase),
+          sweeps,
+        };
+      })
       .sort((x, y) => y.pts - x.pts || y.exacts - x.exacts);
   }, [league.members, leaguePredictions, matchById, phase, profiles]);
 
@@ -915,7 +946,14 @@ function StandingsTab({ league }) {
         {rows.map((r, i) => (
           <div key={r.u} className={"pm-row" + (r.u === userId ? " is-me" : "")}>
             <div className="pm-rank">{i + 1}</div>
-            <div className="pm-rowname">{r.name}{r.u === userId && <span className="pm-tu">tú</span>}</div>
+            <div className="pm-rowname">
+              {r.name}{r.u === userId && <span className="pm-tu">tú</span>}
+              {r.sweeps > 0 && phase === "general" && (
+                <span className="pm-sweep-badge" title={`${r.sweeps} pleno${r.sweeps > 1 ? "s" : ""} del día (+${r.sweeps * 3} pts)`}>
+                  🔥{r.sweeps}
+                </span>
+              )}
+            </div>
             <div className="pm-rowexact">{r.exacts}× exacto</div>
             <div className="pm-rowpts">{r.pts}</div>
           </div>
@@ -1491,6 +1529,7 @@ const CSS = `
 .pm-rank{font-size:18px;font-weight:700;width:22px;color:var(--accent);}
 .pm-rowname{flex:1;font-size:15px;font-weight:600;display:flex;align-items:center;gap:7px;}
 .pm-tu{font-size:9px;background:var(--accent);color:#161122;padding:2px 6px;border-radius:10px;font-weight:700;text-transform:uppercase;}
+.pm-sweep-badge{font-size:11px;margin-left:5px;background:rgba(255,160,0,.18);color:#ffb300;padding:1px 5px;border-radius:8px;font-weight:700;cursor:default;}
 .pm-rowexact{font-size:11px;opacity:.55;}
 .pm-rowpts{font-size:20px;font-weight:700;font-family:'Fredoka';min-width:34px;text-align:right;}
 
