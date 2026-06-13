@@ -939,8 +939,12 @@ function Side({ label, name, logo, val, setVal }) {
 /* ─── Clasificación ──────────────────────────────────────── */
 function StandingsTab({ league }) {
   const { userId, profiles, leaguePredictions, matchById, refreshMatches } = useUser();
-  const [phase,      setPhase]      = useState("general");
-  const [refreshing, setRefreshing] = useState(false);
+  const [phase,        setPhase]        = useState("general");
+  const [refreshing,   setRefreshing]   = useState(false);
+  const [generatingComic, setGeneratingComic] = useState(false);
+  const [comicMsg,     setComicMsg]     = useState("");
+  // comic_url local para mostrar inmediatamente tras generación
+  const [myComicUrl,   setMyComicUrl]   = useState(() => profiles[userId]?.comic_url || null);
 
   const rows = useMemo(() => {
     return league.members
@@ -950,21 +954,61 @@ function StandingsTab({ league }) {
         const badge = getUserBadge(leaguePredictions, matchById, u);
         return {
           u,
-          name:   profiles[u]?.name || u.slice(0, 8),
-          pts:    base + (phase === "general" ? bonus : 0),
+          name:      profiles[u]?.name || u.slice(0, 8),
+          pts:       base + (phase === "general" ? bonus : 0),
           base,
-          exacts: countExacts(leaguePredictions, matchById, u, phase),
+          exacts:    countExacts(leaguePredictions, matchById, u, phase),
           sweeps,
           badge,
+          comicUrl:  u === userId ? myComicUrl : (profiles[u]?.comic_url || null),
         };
       })
       .sort((x, y) => y.pts - x.pts || y.exacts - x.exacts);
-  }, [league.members, leaguePredictions, matchById, phase, profiles]);
+  }, [league.members, leaguePredictions, matchById, phase, profiles, myComicUrl, userId]);
 
   async function handleRefresh() {
     setRefreshing(true);
     await refreshMatches();
     setRefreshing(false);
+  }
+
+  async function handleGenerateComic() {
+    setGeneratingComic(true);
+    setComicMsg("Generando tu caricatura… puede tardar unos segundos.");
+    const myRow = rows.find(r => r.u === userId);
+    const { data: { session } } = await supabase.auth.getSession();
+    if (!session) { setComicMsg("Error: no hay sesión."); setGeneratingComic(false); return; }
+    try {
+      const res = await fetch(
+        `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/comic-gen`,
+        {
+          method:  "POST",
+          headers: {
+            "Content-Type":  "application/json",
+            "Authorization": `Bearer ${session.access_token}`,
+          },
+          body: JSON.stringify({
+            user_id: userId,
+            name:    myRow?.name,
+            badge:   myRow?.badge,
+            pts:     myRow?.pts,
+            exacts:  myRow?.exacts,
+          }),
+        }
+      );
+      const json = await res.json();
+      if (json.ok && json.url) {
+        setMyComicUrl(json.url);
+        setComicMsg("¡Caricatura generada!");
+      } else if (json.error === "imagen_unavailable") {
+        setComicMsg("Gemini Imagen no disponible en este plan. Actívalo en Google AI Studio.");
+      } else {
+        setComicMsg("Error al generar: " + (json.error || "desconocido"));
+      }
+    } catch (e) {
+      setComicMsg("Error de red: " + (e?.message || String(e)));
+    }
+    setGeneratingComic(false);
   }
 
   return (
@@ -983,6 +1027,10 @@ function StandingsTab({ league }) {
         {rows.map((r, i) => (
           <div key={r.u} className={"pm-row" + (r.u === userId ? " is-me" : "")}>
             <div className="pm-rank">{i + 1}</div>
+            {r.comicUrl
+              ? <img src={r.comicUrl} alt={r.name} className="pm-comic-avatar" />
+              : <div className="pm-comic-avatar pm-comic-placeholder">{r.name[0]}</div>
+            }
             <div className="pm-rowname">
               {r.name}{r.u === userId && <span className="pm-tu">tú</span>}
               {r.sweeps > 0 && phase === "general" && (
@@ -1000,6 +1048,19 @@ function StandingsTab({ league }) {
             <div className="pm-rowpts">{r.pts}</div>
           </div>
         ))}
+      </div>
+
+      {/* Botón de generación de cómic — solo visible para el usuario propio */}
+      <div style={{ marginTop: 18, textAlign: "center" }}>
+        <button
+          className="pm-btn pm-btn-sm"
+          onClick={handleGenerateComic}
+          disabled={generatingComic}
+          style={{ fontSize: 13 }}
+        >
+          {generatingComic ? "Generando…" : (myComicUrl ? "🎨 Regenerar mi caricatura" : "🎨 Generar mi caricatura")}
+        </button>
+        {comicMsg && <div className="pm-note" style={{ marginTop: 6, fontSize: 12 }}>{comicMsg}</div>}
       </div>
     </div>
   );
@@ -1636,6 +1697,11 @@ const CSS = `
 .pm-pts-3{background:#1f9e57;color:#fff;}
 .pm-pts-1{background:var(--accent2);color:#161122;}
 .pm-pts-0{background:rgba(255,255,255,.1);color:rgba(255,255,255,.6);}
+
+/* ---- Comic avatar ---- */
+.pm-comic-avatar{width:36px;height:36px;border-radius:50%;object-fit:cover;flex-shrink:0;}
+.pm-comic-placeholder{width:36px;height:36px;border-radius:50%;background:rgba(255,255,255,.12);display:flex;align-items:center;justify-content:center;font-size:14px;font-weight:700;color:rgba(255,255,255,.6);flex-shrink:0;}
+.pm-row{display:flex;align-items:center;gap:8px;}
 
 /* ---- Recap / Crónica ---- */
 .pm-recap{background:rgba(255,255,255,.05);border-radius:14px;padding:14px 16px;margin-bottom:14px;}
