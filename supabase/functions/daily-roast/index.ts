@@ -1,17 +1,13 @@
 /**
- * daily-roast — Crónica diaria de la porra generada por Gemini
+ * daily-roast — Crónica diaria generada por Gemini
  *
- * Llamada por pg_cron a las 23:30 UTC (01:30 CEST) para resumir
- * los partidos del día con humor negro estilo Twitter Fútbol.
- *
- * Para cada liga activa que tenga partidos jugados hoy:
- *   1. Recoge resultados del día + predicciones de los miembros
- *   2. Llama a Gemini Flash para generar la crónica
- *   3. Guarda en daily_recaps
- *   4. Envía Web Push a los miembros suscritos
+ * Llamada por pg_cron a las 23:30 UTC (01:30 CEST).
+ * Busca el ÚLTIMO día con partidos finalizados que tenga predicciones
+ * registradas (no asume que sea "hoy"). Genera la crónica para cada
+ * liga activa con predicciones en ese día.
  *
  * Secrets necesarios:
- *   GEMINI_API_KEY      — Google AI Studio → API key
+ *   GEMINI_API_KEY      — Google AI Studio
  *   VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY, VAPID_SUBJECT
  */
 
@@ -40,41 +36,88 @@ Deno.serve(async (req: Request) => {
       Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
     );
 
-    // ── 1. Partidos finalizados HOY ───────────────────────────
-    const today     = new Date().toISOString().slice(0, 10);
-    const todayStart = `${today}T00:00:00Z`;
-    const todayEnd   = `${today}T23:59:59Z`;
-
-    const { data: todayMatches, error: matchErr } = await supabase
+    // ── 1. Buscar el último día con partidos finalizados ───────
+    // Usa los últimos 3 días para evitar buscar en toda la historia.
+    const { data: recentMatches, error: matchErr } = await supabase
       .from("matches")
       .select("id, home_team, away_team, home_goals, away_goals, kickoff")
       .eq("is_final", true)
-      .gte("kickoff", todayStart)
-      .lte("kickoff", todayEnd);
+      .order("kickoff", { ascending: false })
+      .limit(50);
 
-    if (matchErr) throw new Error(matchErr.message);
-    if (!todayMatches || todayMatches.length === 0) {
-      console.log("[daily-roast] Sin partidos finalizados hoy. Sin recap.");
-      return respond({ ok: true, message: "Sin partidos hoy." });
+    if (matchErr) throw new Error(`matches: ${matchErr.message}`);
+
+    if (!recentMatches || recentMatches.length === 0) {
+      console.log("[daily-roast] Sin partidos finalizados en la BD. Nada que hacer.");
+      return respond({ ok: true, message: "Sin partidos finalizados." });
     }
 
-    // ── 2. Ligas activas ──────────────────────────────────────
-    const { data: leagues, error: lgErr } = await supabase
-      .from("leagues")
-      .select("id, name");
-    if (lgErr) throw new Error(lgErr.message);
-    if (!leagues || leagues.length === 0) return respond({ ok: true, message: "Sin ligas." });
+    // Agrupar por día y coger el más reciente
+    const dayMap: Record<string, typeof recentMatches> = {};
+    for (const m of recentMatches) {
+      const day = (m.kickoff as string).slice(0, 10);
+      (dayMap[day] = dayMap[day] || []).push(m);
+    }
+    const allDays = Object.keys(dayMap).sort().reverse(); // más reciente primero
 
-    // ── 3. Predicciones del día por liga ──────────────────────
-    const matchIds = todayMatches.map((m: any) => m.id);
+    console.log(`[daily-roast] Días con partidos finalizados: ${allDays.join(", ")}`);
+
+    // ── 2. Predicciones del periodo reciente por liga ──────────
+    const recentMatchIds = recentMatches.map((m: any) => m.id);
     const { data: preds, error: predErr } = await supabase
       .from("predictions")
       .select("league_id, user_id, match_id, home_goals, away_goals")
-      .in("match_id", matchIds);
-    if (predErr) throw new Error(predErr.message);
+      .in("match_id", recentMatchIds);
 
-    // Perfiles de usuarios
-    const userIds = [...new Set((preds ?? []).map((p: any) => p.user_id))];
+    if (predErr) throw new Error(`predicciones: ${predErr.message}`);
+
+    if (!preds || preds.length === 0) {
+      console.log("[daily-roast] Sin predicciones para los partidos recientes. Puede que aún no se hayan registrado.");
+      return respond({ ok: true, message: "Sin predicciones para partidos recientes." });
+    }
+
+    // Buscar qué días tienen predicciones
+    const predMatchIds = new Set(preds.map((p: any) => p.match_id));
+    let targetDay: string | null = null;
+
+    for (const day of allDays) {
+      const dayMatchIds = dayMap[day].map((m: any) => m.id);
+      const hasPreds    = dayMatchIds.some(id => predMatchIds.has(id));
+      if (hasPreds) {
+        targetDay = day;
+        console.log(`[daily-roast] Día objetivo: ${targetDay} (${dayMap[day].length} partidos, con predicciones)`);
+        break;
+      }
+      console.log(`[daily-roast] Día ${day}: ${dayMap[day].length} partidos, 0 predicciones → saltando`);
+    }
+
+    if (!targetDay) {
+      console.log("[daily-roast] Ningún día reciente tiene predicciones. Sin recaps.");
+      return respond({ ok: true, message: "Sin predicciones en días recientes." });
+    }
+
+    const todayMatches = dayMap[targetDay];
+
+    // ── 3. Ligas con predicciones ese día ─────────────────────
+    const dayMatchIds = todayMatches.map((m: any) => m.id);
+    const dayPreds    = preds.filter((p: any) => dayMatchIds.includes(p.match_id));
+    const leagueIds   = [...new Set(dayPreds.map((p: any) => p.league_id as string))];
+
+    if (leagueIds.length === 0) {
+      console.log(`[daily-roast] El día ${targetDay} no tiene predicciones registradas.`);
+      return respond({ ok: true, message: `Día ${targetDay} sin predicciones.` });
+    }
+
+    const { data: leagues, error: lgErr } = await supabase
+      .from("leagues")
+      .select("id, name")
+      .in("id", leagueIds);
+    if (lgErr) throw new Error(`ligas: ${lgErr.message}`);
+
+    console.log(`[daily-roast] Generando para ${leagues?.length ?? 0} liga(s): ${leagues?.map((l: any) => l.name).join(", ")}`);
+
+    // ── 4. Perfiles de jugadores ───────────────────────────────
+    const userIds = [...new Set(dayPreds.map((p: any) => p.user_id as string))];
     let profileMap: Record<string, string> = {};
     if (userIds.length > 0) {
       const { data: profs } = await supabase
@@ -86,11 +129,13 @@ Deno.serve(async (req: Request) => {
 
     const results: { league_id: string; recap: string }[] = [];
 
-    for (const lg of leagues) {
-      const lgPreds = (preds ?? []).filter((p: any) => p.league_id === lg.id);
-      if (lgPreds.length === 0) continue; // liga sin predicciones hoy
+    for (const lg of (leagues ?? [])) {
+      const lgPreds = dayPreds.filter((p: any) => p.league_id === lg.id);
+      if (lgPreds.length === 0) {
+        console.log(`[daily-roast] Liga "${lg.name}" sin predicciones ese día.`);
+        continue;
+      }
 
-      // Construir contexto para Gemini
       const matchLines = todayMatches.map((m: any) => {
         const result = `${m.home_team} ${m.home_goals}-${m.away_goals} ${m.away_team}`;
         const predLines = lgPreds
@@ -106,12 +151,11 @@ Deno.serve(async (req: Request) => {
 
       const prompt = `Eres el cronista de una porra de amigos del Mundial 2026, con estilo Twitter Fútbol España: sarcástico, humor negro, referencias a fútbol, directo, máximo 5 párrafos breves.
 Liga: "${lg.name}"
-Partidos de hoy con predicciones:
+Partidos del día ${targetDay}:
 ${matchLines}
 
 Escribe la crónica del día. Destaca al que más puntuó (¿merecido o chiripa?), ridiculiza con cariño al que menos, menciona algún error concreto. Sin emojis en exceso. Sin título "Crónica de...". Empieza directamente.`;
 
-      // Llamada a Gemini Flash
       const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${geminiKey}`;
       const geminiRes = await fetch(geminiUrl, {
         method: "POST",
@@ -121,34 +165,37 @@ Escribe la crónica del día. Destaca al que más puntuó (¿merecido o chiripa?
           generationConfig: { maxOutputTokens: 512, temperature: 0.9 },
         }),
       });
+
       if (!geminiRes.ok) {
-        console.error(`[daily-roast] Gemini error ${geminiRes.status}:`, await geminiRes.text());
+        console.error(`[daily-roast] Gemini error ${geminiRes.status} para "${lg.name}":`, await geminiRes.text());
         continue;
       }
+
       const geminiData = await geminiRes.json();
       const recap = geminiData?.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
-      if (!recap) { console.error("[daily-roast] Gemini devolvió texto vacío."); continue; }
+      if (!recap) {
+        console.error(`[daily-roast] Gemini devolvió texto vacío para liga "${lg.name}".`);
+        continue;
+      }
 
-      // Guardar recap
       await supabase.from("daily_recaps").upsert(
-        { league_id: lg.id, recap_date: today, content: recap, created_at: new Date().toISOString() },
+        { league_id: lg.id, recap_date: targetDay, content: recap, created_at: new Date().toISOString() },
         { onConflict: "league_id,recap_date" }
       );
 
       results.push({ league_id: lg.id, recap });
+      console.log(`[daily-roast] Recap guardado para liga "${lg.name}" (${targetDay}).`);
     }
 
-    // ── 4. Push a suscriptores ────────────────────────────────
+    // ── 5. Push a suscriptores ────────────────────────────────
     let sent = 0;
     const expiredIds: string[] = [];
 
     if (pushEnabled && results.length > 0) {
       const lgIds = results.map(r => r.league_id);
-
-      // Miembros de esas ligas con suscripción push
       const { data: members } = await supabase
         .from("league_members")
-        .select("user_id, league_id")
+        .select("user_id")
         .in("league_id", lgIds);
 
       const memberUserIds = [...new Set((members ?? []).map((m: any) => m.user_id))];
@@ -159,12 +206,11 @@ Escribe la crónica del día. Destaca al que más puntuó (¿merecido o chiripa?
 
       await Promise.allSettled(
         (subs ?? []).map(async (sub: any) => {
-          const payload = JSON.stringify({
-            title: "🗞️ Crónica del día lista",
-            body:  "¿Fuiste el héroe o el desastre de hoy? Lee la crónica de tu porra.",
-          });
           try {
-            await webpush.sendNotification(sub.subscription, payload);
+            await webpush.sendNotification(sub.subscription, JSON.stringify({
+              title: "🗞️ Crónica del día lista",
+              body:  "¿Fuiste el héroe o el desastre de hoy? Lee la crónica de tu porra.",
+            }));
             sent++;
           } catch (err: any) {
             if (err.statusCode === 410 || err.statusCode === 404) expiredIds.push(sub.id);
@@ -175,14 +221,21 @@ Escribe la crónica del día. Destaca al que más puntuó (¿merecido o chiripa?
 
       if (expiredIds.length > 0) {
         await supabase.from("push_subscriptions").delete().in("id", expiredIds);
+        console.log(`[daily-roast] ${expiredIds.length} suscripción(es) caducada(s) eliminada(s).`);
       }
     }
 
-    console.log(`[daily-roast] recaps generados: ${results.length}, push enviados: ${sent}`);
-    return respond({ ok: true, recaps: results.length, sent, expired: expiredIds.length });
+    console.log(`[daily-roast] Día ${targetDay}: ${results.length} recap(s) generado(s), ${sent} push enviado(s).`);
+    return respond({
+      ok:        true,
+      target_day: targetDay,
+      recaps:    results.length,
+      sent,
+      expired:   expiredIds.length,
+    });
 
   } catch (err: any) {
-    console.error("[daily-roast] error:", err);
+    console.error("[daily-roast] error fatal:", err);
     return respond({ ok: false, error: err.message }, 500);
   }
 });

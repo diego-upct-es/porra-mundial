@@ -296,7 +296,7 @@ export default function App() {
     }
     setProfile(data);
     if (data) {
-      setProfiles(prev => ({ ...prev, [userId]: { name: data.display_name } }));
+      setProfiles(prev => ({ ...prev, [userId]: { name: data.display_name, avatar_url: data.avatar_url || null } }));
       loadLeagues(userId);
     }
   }
@@ -312,7 +312,7 @@ export default function App() {
           id, name, code, theme, admin_id,
           league_members (
             user_id, champion_pick,
-            profiles ( id, display_name )
+            profiles ( id, display_name, avatar_url )
           )
         )
       `).eq("user_id", userId),
@@ -331,7 +331,7 @@ export default function App() {
           if (!lg) return null;
           const members = lg.league_members || [];
           members.forEach(m => {
-            if (m.profiles) newProfiles[m.user_id] = { name: m.profiles.display_name };
+            if (m.profiles) newProfiles[m.user_id] = { name: m.profiles.display_name, avatar_url: m.profiles.avatar_url || null };
           });
           const champion = {};
           members.forEach(m => { if (m.champion_pick) champion[m.user_id] = m.champion_pick; });
@@ -400,6 +400,27 @@ export default function App() {
     if (data?.error) return data.error;
     await loadMatches(); // refresca matches → clasificación y resultados se recalculan
     return "ok";
+  }
+
+  // ── Foto de referencia (para viñeta de grupo) ───────────────
+  async function uploadAvatar(file) {
+    const uid = session?.user?.id;
+    if (!uid || !file) return { error: "sin_sesion" };
+    const ext  = file.type.includes("png") ? "png" : "jpg";
+    const path = `users/${uid}/ref.${ext}`;
+    const { error: upErr } = await supabase.storage
+      .from("avatars")
+      .upload(path, file, { contentType: file.type, upsert: true });
+    if (upErr) return { error: upErr.message };
+    const { data: { publicUrl } } = supabase.storage.from("avatars").getPublicUrl(path);
+    const url = `${publicUrl}?t=${Date.now()}`;
+    const { error: profErr } = await supabase
+      .from("profiles")
+      .update({ avatar_url: url })
+      .eq("id", uid);
+    if (profErr) return { error: profErr.message };
+    setProfiles(prev => ({ ...prev, [uid]: { ...prev[uid], avatar_url: url } }));
+    return { url };
   }
 
   // ── Push notifications ───────────────────────────────────────
@@ -539,7 +560,8 @@ export default function App() {
       userId, profile, profiles,
       matches, matchById,
       leaguePredictions, myPredictions,
-      refreshMatches: loadMatches,   // para el botón ↺ en ResultsTab / StandingsTab
+      refreshMatches: loadMatches,
+      uploadAvatar,
     }}>
       <div className="pm-root" style={themeVars(theme)}>
         <style>{CSS}</style>
@@ -592,7 +614,20 @@ function LoadingScreen() {
 
 /* ─── Home: Mis ligas ─────────────────────────────────────── */
 function LeaguesHome({ leagues, loading, onOpen, onCreate, onJoin, onSignOut, pushGranted, pushError, onSubscribePush }) {
-  const { userId, profile, myPredictions, matchById } = useUser();
+  const { userId, profile, profiles, myPredictions, matchById, uploadAvatar } = useUser();
+  const [avatarMsg, setAvatarMsg] = useState("");
+  const myAvatarUrl = profiles[userId]?.avatar_url || null;
+
+  async function handlePhotoChange(e) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setAvatarMsg("Subiendo…");
+    const result = await uploadAvatar(file);
+    setAvatarMsg(result.error ? `Error: ${result.error}` : "Foto guardada ✓");
+    setTimeout(() => setAvatarMsg(""), 3000);
+    e.target.value = "";
+  }
+
   return (
     <div className="pm-screen">
       <header className="pm-hero">
@@ -605,13 +640,24 @@ function LeaguesHome({ leagues, loading, onOpen, onCreate, onJoin, onSignOut, pu
           <div style={{ fontSize: 12, opacity: .75, marginBottom: 6, fontWeight: 600 }}>
             {profile?.display_name}
           </div>
-          <button
-            className="pm-btn pm-btn-ghost"
-            style={{ padding: "6px 12px", fontSize: 12, borderRadius: 10 }}
-            onClick={onSignOut}
-          >
-            Salir
-          </button>
+          <div style={{ display: "flex", gap: 6, justifyContent: "flex-end", alignItems: "center" }}>
+            {/* Mini avatar + botón cámara para la viñeta de grupo */}
+            <label className="pm-avatar-btn" title="Mi foto para las viñetas">
+              {myAvatarUrl
+                ? <img src={myAvatarUrl} alt="mi foto" className="pm-avatar-thumb" />
+                : <span>📷</span>
+              }
+              <input type="file" accept="image/*" style={{ display: "none" }} onChange={handlePhotoChange} />
+            </label>
+            <button
+              className="pm-btn pm-btn-ghost"
+              style={{ padding: "6px 12px", fontSize: 12, borderRadius: 10 }}
+              onClick={onSignOut}
+            >
+              Salir
+            </button>
+          </div>
+          {avatarMsg && <div style={{ fontSize: 10, marginTop: 4, opacity: .8 }}>{avatarMsg}</div>}
         </div>
       </header>
 
@@ -705,7 +751,7 @@ function LeagueView({ league, theme, tab, setTab, onBack, upsertPrediction, setC
       <div className="pm-tabbody">
         {tab === "prediccion"    && <PredictionTab  league={league} upsertPrediction={upsertPrediction} setChampion={setChampion} />}
         {tab === "clasificacion" && <StandingsTab   league={league} />}
-        {tab === "resultados"    && <ResultsTab />}
+        {tab === "resultados"    && <ResultsTab league={league} />}
         {tab === "historico"     && <HistoryTab />}
         {tab === "cronica"       && <RecapTab       league={league} />}
       </div>
@@ -939,12 +985,8 @@ function Side({ label, name, logo, val, setVal }) {
 /* ─── Clasificación ──────────────────────────────────────── */
 function StandingsTab({ league }) {
   const { userId, profiles, leaguePredictions, matchById, refreshMatches } = useUser();
-  const [phase,        setPhase]        = useState("general");
-  const [refreshing,   setRefreshing]   = useState(false);
-  const [generatingComic, setGeneratingComic] = useState(false);
-  const [comicMsg,     setComicMsg]     = useState("");
-  // comic_url local para mostrar inmediatamente tras generación
-  const [myComicUrl,   setMyComicUrl]   = useState(() => profiles[userId]?.comic_url || null);
+  const [phase,      setPhase]      = useState("general");
+  const [refreshing, setRefreshing] = useState(false);
 
   const rows = useMemo(() => {
     return league.members
@@ -954,61 +996,20 @@ function StandingsTab({ league }) {
         const badge = getUserBadge(leaguePredictions, matchById, u);
         return {
           u,
-          name:      profiles[u]?.name || u.slice(0, 8),
-          pts:       base + (phase === "general" ? bonus : 0),
-          base,
-          exacts:    countExacts(leaguePredictions, matchById, u, phase),
+          name:   profiles[u]?.name || u.slice(0, 8),
+          pts:    base + (phase === "general" ? bonus : 0),
+          exacts: countExacts(leaguePredictions, matchById, u, phase),
           sweeps,
           badge,
-          comicUrl:  u === userId ? myComicUrl : (profiles[u]?.comic_url || null),
         };
       })
       .sort((x, y) => y.pts - x.pts || y.exacts - x.exacts);
-  }, [league.members, leaguePredictions, matchById, phase, profiles, myComicUrl, userId]);
+  }, [league.members, leaguePredictions, matchById, phase, profiles]);
 
   async function handleRefresh() {
     setRefreshing(true);
     await refreshMatches();
     setRefreshing(false);
-  }
-
-  async function handleGenerateComic() {
-    setGeneratingComic(true);
-    setComicMsg("Generando tu caricatura… puede tardar unos segundos.");
-    const myRow = rows.find(r => r.u === userId);
-    const { data: { session } } = await supabase.auth.getSession();
-    if (!session) { setComicMsg("Error: no hay sesión."); setGeneratingComic(false); return; }
-    try {
-      const res = await fetch(
-        `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/comic-gen`,
-        {
-          method:  "POST",
-          headers: {
-            "Content-Type":  "application/json",
-            "Authorization": `Bearer ${session.access_token}`,
-          },
-          body: JSON.stringify({
-            user_id: userId,
-            name:    myRow?.name,
-            badge:   myRow?.badge,
-            pts:     myRow?.pts,
-            exacts:  myRow?.exacts,
-          }),
-        }
-      );
-      const json = await res.json();
-      if (json.ok && json.url) {
-        setMyComicUrl(json.url);
-        setComicMsg("¡Caricatura generada!");
-      } else if (json.error === "imagen_unavailable") {
-        setComicMsg("Gemini Imagen no disponible en este plan. Actívalo en Google AI Studio.");
-      } else {
-        setComicMsg("Error al generar: " + (json.error || "desconocido"));
-      }
-    } catch (e) {
-      setComicMsg("Error de red: " + (e?.message || String(e)));
-    }
-    setGeneratingComic(false);
   }
 
   return (
@@ -1027,10 +1028,6 @@ function StandingsTab({ league }) {
         {rows.map((r, i) => (
           <div key={r.u} className={"pm-row" + (r.u === userId ? " is-me" : "")}>
             <div className="pm-rank">{i + 1}</div>
-            {r.comicUrl
-              ? <img src={r.comicUrl} alt={r.name} className="pm-comic-avatar" />
-              : <div className="pm-comic-avatar pm-comic-placeholder">{r.name[0]}</div>
-            }
             <div className="pm-rowname">
               {r.name}{r.u === userId && <span className="pm-tu">tú</span>}
               {r.sweeps > 0 && phase === "general" && (
@@ -1049,30 +1046,21 @@ function StandingsTab({ league }) {
           </div>
         ))}
       </div>
-
-      {/* Botón de generación de cómic — solo visible para el usuario propio */}
-      <div style={{ marginTop: 18, textAlign: "center" }}>
-        <button
-          className="pm-btn pm-btn-sm"
-          onClick={handleGenerateComic}
-          disabled={generatingComic}
-          style={{ fontSize: 13 }}
-        >
-          {generatingComic ? "Generando…" : (myComicUrl ? "🎨 Regenerar mi caricatura" : "🎨 Generar mi caricatura")}
-        </button>
-        {comicMsg && <div className="pm-note" style={{ marginTop: 6, fontSize: 12 }}>{comicMsg}</div>}
-      </div>
     </div>
   );
 }
 
 /* ─── Resultados ─────────────────────────────────────────── */
-function ResultsTab() {
+function ResultsTab({ league }) {
   const { matches, refreshMatches } = useUser();
   const [refreshing, setRefreshing] = useState(false);
   const [scorers,    setScorers]    = useState([]);
+  // comics: { [YYYY-MM-DD]: { url?, loading?, error? } }
+  const [comics,     setComics]     = useState({});
+  // viñeta ampliada: { day, url }
+  const [enlarged,   setEnlarged]   = useState(null);
 
-  // Carga goleadores desde player_stats al montar el componente
+  // Carga goleadores
   useEffect(() => {
     supabase
       .from("player_stats")
@@ -1082,9 +1070,30 @@ function ResultsTab() {
       .then(({ data }) => setScorers(data || []));
   }, []);
 
-  const played = matches
-    .filter(m => m.is_final)
-    .sort((a, b) => new Date(b.kickoff) - new Date(a.kickoff));
+  // Carga viñetas ya generadas para esta liga
+  useEffect(() => {
+    if (!league?.id) return;
+    supabase
+      .from("daily_comics")
+      .select("match_day, image_url")
+      .eq("league_id", league.id)
+      .then(({ data }) => {
+        if (!data) return;
+        const map = {};
+        data.forEach(c => { map[c.match_day] = { url: c.image_url }; });
+        setComics(map);
+      });
+  }, [league?.id]);
+
+  // Agrupa partidos finalizados por día UTC, más reciente primero
+  const byDay = useMemo(() => {
+    const days = {};
+    matches.filter(m => m.is_final).forEach(m => {
+      const day = m.kickoff.slice(0, 10);
+      (days[day] = days[day] || []).push(m);
+    });
+    return Object.entries(days).sort(([a], [b]) => b.localeCompare(a));
+  }, [matches]);
 
   async function handleRefresh() {
     setRefreshing(true);
@@ -1100,6 +1109,46 @@ function ResultsTab() {
     setRefreshing(false);
   }
 
+  async function handleGenerateComic(matchDay) {
+    setComics(prev => ({ ...prev, [matchDay]: { loading: true } }));
+    const { data: { session } } = await supabase.auth.getSession();
+    if (!session) {
+      setComics(prev => ({ ...prev, [matchDay]: { error: "Sin sesión activa" } }));
+      return;
+    }
+    try {
+      const res = await fetch(
+        `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/comic-gen`,
+        {
+          method:  "POST",
+          headers: {
+            "Content-Type":  "application/json",
+            "Authorization": `Bearer ${session.access_token}`,
+          },
+          body: JSON.stringify({ league_id: league.id, match_day: matchDay }),
+        }
+      );
+      const json = await res.json();
+      if (json.ok && json.url) {
+        setComics(prev => ({ ...prev, [matchDay]: { url: json.url } }));
+        setEnlarged({ day: matchDay, url: json.url });
+      } else if (json.error === "image_model_unavailable") {
+        setComics(prev => ({ ...prev, [matchDay]: { error: "Gemini imagen no disponible con esta API key. " + (json.hint || "") } }));
+      } else {
+        setComics(prev => ({ ...prev, [matchDay]: { error: json.error || "Error desconocido" } }));
+      }
+    } catch (e) {
+      setComics(prev => ({ ...prev, [matchDay]: { error: e?.message || String(e) } }));
+    }
+  }
+
+  function fmtDay(dateStr) {
+    // dateStr = "YYYY-MM-DD"
+    return new Date(dateStr + "T12:00:00Z").toLocaleDateString("es-ES", {
+      weekday: "long", day: "numeric", month: "long",
+    });
+  }
+
   return (
     <div className="pm-pad">
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", margin: "22px 2px 12px" }}>
@@ -1108,26 +1157,75 @@ function ResultsTab() {
           {refreshing ? "…" : "↺"}
         </button>
       </div>
-      {played.length === 0 && (
+
+      {byDay.length === 0 && (
         <div className="pm-note">Aún no hay partidos finalizados.</div>
       )}
-      {played.map(m => (
-        <div key={m.id} className="pm-result">
-          <div className="pm-result-side">
-            <TeamLogo src={m.home_logo} name={m.home_team} size={16} />{" "}{m.home_team}
+
+      {byDay.map(([day, dayMatches]) => {
+        const comic = comics[day];
+        return (
+          <div key={day} className="pm-day-group">
+            <div className="pm-day-label">{fmtDay(day)}</div>
+
+            {dayMatches.map(m => (
+              <div key={m.id} className="pm-result">
+                <div className="pm-result-side">
+                  <TeamLogo src={m.home_logo} name={m.home_team} size={16} />{" "}{m.home_team}
+                </div>
+                <div className="pm-result-score">{m.home_goals}<span>–</span>{m.away_goals}</div>
+                <div className="pm-result-side pm-result-side-r">
+                  {m.away_team}{" "}<TeamLogo src={m.away_logo} name={m.away_team} size={16} />
+                </div>
+              </div>
+            ))}
+
+            {/* Sección viñeta de grupo */}
+            {league && (
+              <div className="pm-day-comic-row">
+                {comic?.url ? (
+                  <button className="pm-comic-thumb-btn" onClick={() => setEnlarged({ day, url: comic.url })}
+                    title="Ver viñeta completa">
+                    <img src={comic.url} alt={`Viñeta ${day}`} className="pm-comic-thumb" />
+                    <span className="pm-comic-thumb-label">Ver viñeta →</span>
+                  </button>
+                ) : comic?.loading ? (
+                  <div className="pm-note pm-note-loading">🎨 Generando viñeta… (30-60 s)</div>
+                ) : comic?.error ? (
+                  <details className="pm-comic-err">
+                    <summary>⚠ No se pudo generar la viñeta</summary>
+                    <div className="pm-note" style={{ marginTop: 4 }}>{comic.error}</div>
+                  </details>
+                ) : (
+                  <button className="pm-btn pm-btn-sm pm-btn-comic"
+                    onClick={() => handleGenerateComic(day)}>
+                    🎨 Mostrar viñeta del grupo
+                  </button>
+                )}
+              </div>
+            )}
           </div>
-          <div className="pm-result-score">{m.home_goals}<span>–</span>{m.away_goals}</div>
-          <div className="pm-result-side pm-result-side-r">
-            {m.away_team}{" "}<TeamLogo src={m.away_logo} name={m.away_team} size={16} />
-          </div>
-        </div>
-      ))}
+        );
+      })}
 
       <SectionTitle k="Pichichi" v="Máximos goleadores" />
       {scorers.length === 0
         ? <div className="pm-note">Aún no hay goleadores registrados.</div>
         : <ScorersList rows={scorers} />
       }
+
+      {/* Modal de viñeta ampliada */}
+      {enlarged && (
+        <div className="pm-overlay" onClick={() => setEnlarged(null)}>
+          <div className="pm-comic-modal" onClick={e => e.stopPropagation()}>
+            <div className="pm-modal-head">
+              <h3>Viñeta · {fmtDay(enlarged.day)}</h3>
+              <button className="pm-close" onClick={() => setEnlarged(null)}>✕</button>
+            </div>
+            <img src={enlarged.url} alt="Viñeta del grupo" style={{ width: "100%", borderRadius: 12 }} />
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -1698,10 +1796,22 @@ const CSS = `
 .pm-pts-1{background:var(--accent2);color:#161122;}
 .pm-pts-0{background:rgba(255,255,255,.1);color:rgba(255,255,255,.6);}
 
-/* ---- Comic avatar ---- */
-.pm-comic-avatar{width:36px;height:36px;border-radius:50%;object-fit:cover;flex-shrink:0;}
-.pm-comic-placeholder{width:36px;height:36px;border-radius:50%;background:rgba(255,255,255,.12);display:flex;align-items:center;justify-content:center;font-size:14px;font-weight:700;color:rgba(255,255,255,.6);flex-shrink:0;}
-.pm-row{display:flex;align-items:center;gap:8px;}
+/* ---- Avatar propio (home screen) ---- */
+.pm-avatar-btn{display:inline-flex;align-items:center;justify-content:center;width:32px;height:32px;border-radius:50%;background:rgba(255,255,255,.12);cursor:pointer;font-size:16px;overflow:hidden;flex-shrink:0;border:1.5px solid rgba(255,255,255,.2);}
+.pm-avatar-thumb{width:100%;height:100%;object-fit:cover;}
+
+/* ---- Viñeta de grupo por día ---- */
+.pm-day-group{margin-bottom:22px;}
+.pm-day-label{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:var(--accent2);margin-bottom:8px;padding:0 2px;}
+.pm-day-comic-row{margin-top:8px;display:flex;justify-content:center;}
+.pm-btn-comic{background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.15);color:rgba(255,255,255,.85);font-size:12px;padding:7px 16px;border-radius:12px;}
+.pm-btn-comic:hover{background:rgba(255,255,255,.13);}
+.pm-note-loading{font-style:italic;}
+.pm-comic-err{font-size:11px;color:rgba(255,100,100,.85);cursor:pointer;padding:4px 0;}
+.pm-comic-thumb-btn{background:none;border:none;padding:0;cursor:pointer;display:flex;flex-direction:column;align-items:center;gap:5px;}
+.pm-comic-thumb{width:120px;height:120px;object-fit:cover;border-radius:10px;box-shadow:0 3px 12px rgba(0,0,0,.5);}
+.pm-comic-thumb-label{font-size:11px;color:var(--accent2);font-weight:600;}
+.pm-comic-modal{width:100%;max-width:430px;background:var(--deep);border-radius:26px 26px 0 0;padding:18px 14px calc(30px + env(safe-area-inset-bottom));}
 
 /* ---- Recap / Crónica ---- */
 .pm-recap{background:rgba(255,255,255,.05);border-radius:14px;padding:14px 16px;margin-bottom:14px;}
