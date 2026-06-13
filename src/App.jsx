@@ -695,20 +695,57 @@ function PredictionTab({ league, upsertPrediction, setChampion }) {
 }
 
 function ChampionCard({ league, setChampion }) {
-  const { userId } = useUser();
-  const mine  = league.champion[userId];
-  const teams = ["ESP", "BRA", "ARG", "FRA", "ENG", "GER", "POR", "MEX"];
+  const { userId, matches } = useUser();
+  const mine = league.champion[userId];
+  const [search, setSearch] = useState('');
+
+  // Lista de equipos únicos extraída de los partidos reales, ordenada alfabéticamente
+  const teams = useMemo(() => {
+    const map = {};
+    matches.forEach(m => {
+      if (m.home_team) map[m.home_team] = m.home_logo;
+      if (m.away_team) map[m.away_team] = m.away_logo;
+    });
+    return Object.entries(map)
+      .map(([name, logo]) => ({ name, logo }))
+      .sort((a, b) => a.name.localeCompare(b.name, 'es'));
+  }, [matches]);
+
+  const myTeam = teams.find(t => t.name === mine);
+  const q = search.trim().toLowerCase();
+  const filtered = q ? teams.filter(t => t.name.toLowerCase().includes(q)) : teams;
+
   return (
     <div className="pm-champ">
-      <div className="pm-champ-head"><span className="pm-trophy">🏆</span> Campeón del Mundial <em>+5 pts</em></div>
-      <div className="pm-champ-grid">
-        {teams.map(c => (
-          <button key={c} className={"pm-champ-opt" + (mine === c ? " is-on" : "")} onClick={() => setChampion(c)}>
-            <Flag code={c} size={15} />{NAME[c]}
-          </button>
-        ))}
+      <div className="pm-champ-head">
+        <span className="pm-trophy">🏆</span> Campeón del Mundial <em>+5 pts</em>
       </div>
-      {mine && <div className="pm-champ-note">Tu apuesta: {NAME[mine]} — se resuelve al final</div>}
+      {mine ? (
+        <div className="pm-champ-current">
+          <TeamLogo src={myTeam?.logo} name={mine} size={22} />
+          <span className="pm-champ-current-name">{mine}</span>
+          <button className="pm-champ-change" onClick={() => setChampion(null)}>cambiar</button>
+        </div>
+      ) : (
+        <>
+          <input
+            className="pm-input pm-champ-search"
+            placeholder="Buscar selección…"
+            value={search}
+            onChange={e => setSearch(e.target.value)}
+          />
+          <div className="pm-champ-scroll">
+            {filtered.length === 0 && (
+              <div className="pm-note" style={{ padding: '8px 0' }}>Sin resultados.</div>
+            )}
+            {filtered.map(t => (
+              <button key={t.name} className="pm-champ-opt" onClick={() => setChampion(t.name)}>
+                <TeamLogo src={t.logo} name={t.name} size={16} />{t.name}
+              </button>
+            ))}
+          </div>
+        </>
+      )}
     </div>
   );
 }
@@ -1354,11 +1391,14 @@ const CSS = `
 .pm-champ-head{font-size:15px;font-weight:600;display:flex;align-items:center;gap:8px;margin-bottom:12px;}
 .pm-champ-head em{margin-left:auto;background:var(--accent2);color:#161122;font-style:normal;font-size:12px;font-weight:700;padding:3px 9px;border-radius:20px;}
 .pm-trophy{font-size:20px;}
-.pm-champ-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;}
-.pm-champ-opt{background:rgba(255,255,255,.07);border:2px solid transparent;color:#fff;border-radius:14px;padding:10px;font-size:13px;font-weight:600;cursor:pointer;display:flex;align-items:center;gap:7px;font-family:'Inter';}
-.pm-champ-opt.is-on{border-color:var(--accent);background:rgba(255,255,255,.14);}
-.pm-champ-flag{font-size:17px;}
-.pm-champ-note{font-size:12px;margin-top:11px;opacity:.85;}
+.pm-champ-search{margin:8px 0;padding:10px 12px;font-size:14px;}
+.pm-champ-scroll{max-height:190px;overflow-y:auto;display:flex;flex-direction:column;gap:4px;margin-top:4px;}
+.pm-champ-scroll::-webkit-scrollbar{width:4px;}.pm-champ-scroll::-webkit-scrollbar-thumb{background:rgba(255,255,255,.2);border-radius:4px;}
+.pm-champ-opt{background:rgba(255,255,255,.07);border:none;color:#fff;border-radius:12px;padding:9px 12px;font-size:13px;font-weight:600;cursor:pointer;display:flex;align-items:center;gap:8px;font-family:'Inter';text-align:left;}
+.pm-champ-opt:hover{background:rgba(255,255,255,.13);}
+.pm-champ-current{display:flex;align-items:center;gap:10px;background:rgba(255,255,255,.1);border-radius:14px;padding:12px 14px;margin:6px 0;}
+.pm-champ-current-name{flex:1;font-size:15px;font-weight:600;}
+.pm-champ-change{font-size:12px;background:none;border:1px solid rgba(255,255,255,.3);color:rgba(255,255,255,.8);border-radius:10px;padding:5px 10px;cursor:pointer;}
 
 /* ---- Scoreboard ---- */
 .pm-board{background:#100f28;border:2px solid rgba(255,255,255,.07);border-radius:24px;padding:16px 14px 14px;margin-bottom:14px;box-shadow:0 8px 0 rgba(0,0,0,.35);}
