@@ -131,14 +131,36 @@ function totalPoints(predictions, matchById, userId, phase = "general") {
   }, 0);
 }
 
-/** Cuenta exactos (+3) de userId en las predicciones dadas. */
+/** Cuenta exactos (3 o 5 pts) de userId en las predicciones dadas. */
 function countExacts(predictions, matchById, userId, phase = "general") {
   return predictions.reduce((n, p) => {
     if (p.user_id !== userId) return n;
     const m = matchById[p.match_id];
     if (!m || !m.is_final) return n;
     if (phase !== "general" && m.phase !== phase) return n;
-    return n + (scorePrediction(p, m) === 3 ? 1 : 0);
+    return n + (scorePrediction(p, m) >= 3 ? 1 : 0);
+  }, 0);
+}
+
+/** Bonus de posición para el goleador elegido (+1/+2/+3/+4). */
+const SCORER_BONUS = { Attacker: 1, Midfielder: 2, Defender: 3, Goalkeeper: 4 };
+
+/**
+ * Suma el bonus de goleador de userId.
+ * Solo puntúa si el partido es is_final y el jugador elegido marcó
+ * al menos un gol no-propio (aparece en match_goals con is_own_goal=false).
+ */
+function calcScorerBonus(scorerPicks, matchGoals, matchById, userId) {
+  return scorerPicks.reduce((sum, pick) => {
+    if (pick.user_id !== userId) return sum;
+    const m = matchById[pick.match_id];
+    if (!m || !m.is_final) return sum;
+    const scored = matchGoals.some(
+      g => g.match_id      === pick.match_id
+        && g.ext_player_id === pick.ext_player_id
+        && !g.is_own_goal,
+    );
+    return sum + (scored ? (SCORER_BONUS[pick.position] ?? 0) : 0);
   }, 0);
 }
 
@@ -224,6 +246,12 @@ export default function App() {
   // Predicciones de TODOS los miembros para la liga activa (para marcadores pillados + histórico + clasificación)
   const [leaguePredictions, setLeaguePredictions] = useState([]);
 
+  // Predicciones de goleador de TODOS los miembros para la liga activa
+  const [scorerPicks, setScorerPicks] = useState([]);
+
+  // Goles anotados en todos los partidos finalizados (global)
+  const [matchGoals, setMatchGoals] = useState([]);
+
   // Predicciones propias a través de todas las ligas (para el marcador de puntos en la tarjeta de liga)
   const [myPredictions, setMyPredictions] = useState([]);
 
@@ -274,6 +302,7 @@ export default function App() {
   useEffect(() => {
     if (view !== "league" || !leagueId) {
       setLeaguePredictions([]);
+      setScorerPicks([]);
       return;
     }
 
@@ -281,8 +310,16 @@ export default function App() {
 
     // Función de recarga reutilizada por la carga inicial y el handler RT
     function reload() {
-      supabase.from("predictions").select("*").eq("league_id", leagueId)
-        .then(({ data }) => { if (!cancelled && data) setLeaguePredictions(data); });
+      Promise.all([
+        supabase.from("predictions").select("*").eq("league_id", leagueId),
+        supabase.from("scorer_picks")
+          .select("match_id, user_id, ext_player_id, player_name, team_name, position")
+          .eq("league_id", leagueId),
+      ]).then(([{ data: preds }, { data: picks }]) => {
+        if (cancelled) return;
+        if (preds) setLeaguePredictions(preds);
+        if (picks) setScorerPicks(picks);
+      });
     }
 
     reload(); // carga inicial
@@ -329,10 +366,15 @@ export default function App() {
     return () => { supabase.removeChannel(channel); };
   }, [session?.user?.id]); // se recrea solo si cambia el usuario (login/logout)
 
-  // ── Carga de partidos ────────────────────────────────────────
+  // ── Carga de partidos + goles ─────────────────────────────────
   async function loadMatches() {
-    const { data } = await supabase.from("matches").select("*").order("kickoff");
-    setMatches(data || []);
+    const [{ data: matchData }, { data: goalsData }] = await Promise.all([
+      supabase.from("matches").select("*").order("kickoff"),
+      supabase.from("match_goals")
+        .select("match_id, ext_player_id, player_name, team_id, is_own_goal"),
+    ]);
+    setMatches(matchData || []);
+    setMatchGoals(goalsData || []);
   }
 
   // ── Carga de perfil ──────────────────────────────────────────
@@ -438,6 +480,35 @@ export default function App() {
   }
 
   /**
+   * Guarda el goleador elegido por el usuario para un partido.
+   * player = { ext_player_id, player_name, team_name, position }
+   * Devuelve 'ok' | 'locked' | 'error'.
+   * 'locked' → el partido ya empezó (trigger check_scorer_pick_window).
+   */
+  async function upsertScorerPick(matchId, player) {
+    const uid = session?.user.id;
+    const { error } = await supabase.from("scorer_picks").upsert({
+      league_id:     leagueId,
+      match_id:      matchId,
+      user_id:       uid,
+      ext_player_id: player.ext_player_id,
+      player_name:   player.player_name,
+      team_name:     player.team_name,
+      position:      player.position,
+    }, { onConflict: "league_id,match_id,user_id" });
+
+    if (error) return error.message.includes("scorer_pick_locked") ? "locked" : "error";
+
+    // Refresca picks de la liga activa
+    const { data: picks } = await supabase
+      .from("scorer_picks")
+      .select("match_id, user_id, ext_player_id, player_name, team_name, position")
+      .eq("league_id", leagueId);
+    setScorerPicks(picks || []);
+    return "ok";
+  }
+
+  /**
    * Override de admin: corrige el resultado de un partido.
    * Llama a admin_update_match (SECURITY DEFINER) que valida
    * que el usuario sea admin de al menos una liga.
@@ -479,23 +550,54 @@ export default function App() {
 
   // ── Push notifications ───────────────────────────────────────
 
-  // Comprueba si la suscripción está guardada en la BD.
-  // "Avisos activados" solo si hay fila real, no solo con el permiso del navegador.
+  // Verifica la suscripción push: compara el endpoint vivo del navegador con el de la BD.
+  // "Avisos activados" solo si AMBOS existen y coinciden.
+  // Si hay drift (suscripción viva pero sin fila BD, o endpoints distintos), re-sincroniza.
   useEffect(() => {
     if (!session?.user?.id) return;
     if (!('Notification' in window)) { setPushGranted('unsupported'); return; }
     if (Notification.permission === 'denied') { setPushGranted('denied'); return; }
+    if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
+      setPushGranted('unsupported'); return;
+    }
 
-    supabase
-      .from('push_subscriptions')
-      .select('id')
-      .eq('user_id', session.user.id)
-      .maybeSingle()
-      .then(({ data }) => {
-        // Solo mostramos "Avisos activados" si hay fila real en la BD
-        if (data) setPushGranted('granted');
-        // Si no hay fila (aunque el permiso esté concedido) mostramos el botón
-      });
+    const uid = session.user.id;
+
+    async function verifySubscription() {
+      try {
+        const reg     = await navigator.serviceWorker.ready;
+        const liveSub = await reg.pushManager.getSubscription();
+
+        const { data: dbRow } = await supabase
+          .from('push_subscriptions')
+          .select('id, subscription')
+          .eq('user_id', uid)
+          .maybeSingle();
+
+        if (!liveSub) {
+          // Navegador sin suscripción viva → limpiar fila BD si existía
+          if (dbRow) await supabase.from('push_subscriptions').delete().eq('user_id', uid);
+          return; // pushGranted queda null → muestra botón "Activar"
+        }
+
+        if (dbRow && liveSub.endpoint === dbRow.subscription?.endpoint) {
+          // Todo coincide
+          setPushGranted('granted');
+          return;
+        }
+
+        // Drift (BD vacía o endpoint cambiado) → upsert con suscripción actual
+        const { error } = await supabase.from('push_subscriptions').upsert(
+          { user_id: uid, subscription: liveSub.toJSON() },
+          { onConflict: 'user_id' },
+        );
+        if (!error) setPushGranted('granted');
+      } catch (err) {
+        console.warn('[push] verifySubscription:', err);
+      }
+    }
+
+    verifySubscription();
   }, [session?.user?.id]);
 
   /** Convierte la clave VAPID base64url a Uint8Array para PushManager. */
@@ -622,9 +724,10 @@ export default function App() {
       userId, profile, profiles,
       matches, matchById,
       leaguePredictions, myPredictions,
+      scorerPicks, matchGoals, upsertScorerPick,
       refreshMatches: loadMatches,
       uploadAvatar,
-      pushGranted, pushError, subscribeToPush: subscribeToPush,
+      pushGranted, pushError, subscribeToPush,
     }}>
       <div className="pm-root" style={themeVars(theme)}>
         <style>{CSS}</style>
@@ -851,7 +954,7 @@ function LeagueView({ league, theme, tab, setTab, onBack, upsertPrediction, setC
 
 /* ─── Predicción ─────────────────────────────────────────── */
 function PredictionTab({ league, upsertPrediction, setChampion }) {
-  const { matches, leaguePredictions, userId } = useUser();
+  const { matches, leaguePredictions, scorerPicks, userId } = useUser();
   const open   = matches.filter(m => getMatchState(m) === "open");
   const locked = matches.filter(m => getMatchState(m) === "locked");
   const soon   = matches.filter(m => getMatchState(m) === "soon");
@@ -872,6 +975,7 @@ function PredictionTab({ league, upsertPrediction, setChampion }) {
           <SectionTitle k="En juego" v="Predicción cerrada" />
           {locked.map(m => {
             const myPred = leaguePredictions.find(p => p.match_id === m.id && p.user_id === userId);
+            const myPick = scorerPicks.find(p => p.match_id === m.id && p.user_id === userId);
             return (
               <div key={m.id} className="pm-locked-match">
                 <div className="pm-locked-meta">{formatKickoff(m.kickoff)}</div>
@@ -889,6 +993,13 @@ function PredictionTab({ league, upsertPrediction, setChampion }) {
                   }
                   <span className="pm-locked-icon">🔒</span>
                 </div>
+                {myPick && (
+                  <div className="pm-locked-scorer">
+                    <span className="pm-locked-label">Tu goleador:</span>
+                    <strong>{myPick.player_name}</strong>
+                    <span className="pm-scorer-pos-text"> · {myPick.position}</span>
+                  </div>
+                )}
               </div>
             );
           })}
@@ -1004,19 +1115,23 @@ function ChampionCard({ league, setChampion }) {
 
 /* ─── Scoreboard — tarjeta de predicción de un partido ────── */
 function Scoreboard({ match, upsertPrediction }) {
-  const { userId, profiles, leaguePredictions } = useUser();
+  const { userId, profiles, leaguePredictions, scorerPicks, upsertScorerPick } = useUser();
 
-  // Predicción existente del usuario para este partido
-  const existing = leaguePredictions.find(
-    p => p.match_id === match.id && p.user_id === userId,
-  );
+  const existing     = leaguePredictions.find(p => p.match_id === match.id && p.user_id === userId);
+  const existingPick = scorerPicks.find(p => p.match_id === match.id && p.user_id === userId);
 
-  const [h, setH]       = useState(0);
-  const [a, setA]       = useState(0);
+  const [h, setH]           = useState(0);
+  const [a, setA]           = useState(0);
   const [inited, setInited] = useState(false);
   const [saving, setSaving] = useState(false);
   const [warn,   setWarn]   = useState(null);
   const [flash,  setFlash]  = useState(false);
+
+  // Scorer picker state
+  const [squad,        setSquad]        = useState([]);
+  const [scorerSearch, setScorerSearch] = useState("");
+  const [pendingPick,  setPendingPick]  = useState(null);
+  const [savingPick,   setSavingPick]   = useState(false);
 
   // Inicializa h/a con la predicción guardada la primera vez que llega del servidor
   useEffect(() => {
@@ -1027,7 +1142,20 @@ function Scoreboard({ match, upsertPrediction }) {
     }
   }, [inited, existing]);
 
-  // Marcadores ya pillados por otros miembros en este partido/liga
+  // Carga la plantilla del partido (home + away)
+  useEffect(() => {
+    const ids = [match.home_team_id, match.away_team_id].filter(Boolean);
+    if (ids.length === 0) return;
+    supabase
+      .from("squads")
+      .select("ext_team_id, ext_player_id, player_name, position, shirt_number")
+      .in("ext_team_id", ids)
+      .order("position")
+      .order("player_name")
+      .then(({ data }) => setSquad(data || []));
+  }, [match.home_team_id, match.away_team_id]);
+
+  // Marcadores ya pillados por otros miembros
   const takenByOthers = useMemo(() => {
     const map = {};
     leaguePredictions.forEach(p => {
@@ -1038,9 +1166,17 @@ function Scoreboard({ match, upsertPrediction }) {
     return map;
   }, [leaguePredictions, match.id, userId, profiles]);
 
+  // Jugadores filtrados por búsqueda
+  const filteredSquad = useMemo(() => {
+    const q = scorerSearch.trim().toLowerCase();
+    if (!q) return squad;
+    return squad.filter(
+      p => p.player_name.toLowerCase().includes(q) || p.position.toLowerCase().includes(q),
+    );
+  }, [squad, scorerSearch]);
+
   const key       = `${h}-${a}`;
   const blockedBy = takenByOthers[key];
-  // saved: el valor actual coincide exactamente con lo guardado en DB
   const saved     = !!(existing && existing.home_goals === h && existing.away_goals === a);
   const takenList = Object.keys(takenByOthers);
 
@@ -1060,8 +1196,15 @@ function Scoreboard({ match, upsertPrediction }) {
       setFlash(true);
       setTimeout(() => setFlash(false), 1200);
     }
-    // Si result === 'ok', leaguePredictions se refresca en el contexto
-    // y `existing` se actualiza → `saved` pasa a true automáticamente.
+  }
+
+  async function commitScorerPick() {
+    if (!pendingPick) return;
+    setSavingPick(true);
+    await upsertScorerPick(match.id, pendingPick);
+    setSavingPick(false);
+    setPendingPick(null);
+    setScorerSearch("");
   }
 
   const groupStr = match.phase === "grupos" ? `Grupo ${match.grp}` : (match.grp || "");
@@ -1097,6 +1240,87 @@ function Scoreboard({ match, upsertPrediction }) {
       >
         {saving ? "Guardando…" : saved ? `✓ Guardado: ${h}–${a}` : "Guardar predicción"}
       </button>
+
+      {/* ── Goleador del partido ────────────────────────────── */}
+      {squad.length > 0 && (
+        <div className="pm-scorer-section">
+          <div className="pm-scorer-title">
+            Goleador
+            {existingPick && !pendingPick && (
+              <span className="pm-scorer-saved">
+                ✓ {existingPick.player_name}
+                <span className="pm-scorer-pos-text"> · {existingPick.position}</span>
+              </span>
+            )}
+          </div>
+
+          {pendingPick ? (
+            <div className="pm-scorer-pending">
+              <span className="pm-scorer-pending-name">
+                {pendingPick.player_name}
+                <em className="pm-scorer-pos-text"> · {pendingPick.position}</em>
+              </span>
+              <div className="pm-scorer-pending-btns">
+                <button
+                  className="pm-btn pm-btn-primary pm-btn-sm"
+                  onClick={commitScorerPick}
+                  disabled={savingPick}
+                >
+                  {savingPick ? "…" : "Confirmar"}
+                </button>
+                <button
+                  className="pm-btn pm-btn-ghost pm-btn-sm"
+                  onClick={() => setPendingPick(null)}
+                >
+                  Cancelar
+                </button>
+              </div>
+            </div>
+          ) : (
+            <input
+              className="pm-input pm-scorer-search"
+              placeholder="Buscar jugador…"
+              value={scorerSearch}
+              onChange={e => setScorerSearch(e.target.value)}
+            />
+          )}
+
+          {!pendingPick && (
+            <div className="pm-scorer-list">
+              {filteredSquad.slice(0, 30).map(p => (
+                <button
+                  key={`${p.ext_team_id}-${p.ext_player_id}`}
+                  className={
+                    "pm-scorer-opt" +
+                    (existingPick?.ext_player_id === p.ext_player_id ? " is-picked" : "")
+                  }
+                  onClick={() => {
+                    setScorerSearch("");
+                    setPendingPick({
+                      ext_player_id: p.ext_player_id,
+                      player_name:   p.player_name,
+                      team_name:     p.ext_team_id === match.home_team_id
+                        ? match.home_team : match.away_team,
+                      position:      p.position,
+                    });
+                  }}
+                >
+                  <span className="pm-scorer-name">{p.player_name}</span>
+                  <span className={"pm-scorer-pos-badge pm-pos-" + p.position.toLowerCase()}>
+                    {p.position[0]}
+                  </span>
+                  {p.shirt_number != null && (
+                    <span className="pm-scorer-num">#{p.shirt_number}</span>
+                  )}
+                </button>
+              ))}
+              {filteredSquad.length === 0 && scorerSearch && (
+                <div className="pm-note" style={{ padding: "6px 0", fontSize: 12 }}>Sin resultados.</div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -1116,7 +1340,8 @@ function Side({ label, name, logo, val, setVal }) {
 
 /* ─── Clasificación ──────────────────────────────────────── */
 function StandingsTab({ league }) {
-  const { userId, profiles, leaguePredictions, matchById, refreshMatches } = useUser();
+  const { userId, profiles, leaguePredictions, scorerPicks, matchGoals,
+          matchById, refreshMatches } = useUser();
   const [phase,       setPhase]       = useState("general");
   const [refreshing,  setRefreshing]  = useState(false);
   // Viñeta más reciente para esta liga (generada automáticamente por poll-results)
@@ -1142,19 +1367,23 @@ function StandingsTab({ league }) {
     return league.members
       .map(u => {
         const { sweeps, bonus } = calcDailySweeps(leaguePredictions, matchById, u);
-        const base  = totalPoints(leaguePredictions, matchById, u, phase);
-        const badge = getUserBadge(leaguePredictions, matchById, u);
+        const base   = totalPoints(leaguePredictions, matchById, u, phase);
+        const sBonus = phase === "general"
+          ? calcScorerBonus(scorerPicks, matchGoals, matchById, u)
+          : 0;
+        const badge  = getUserBadge(leaguePredictions, matchById, u);
         return {
           u,
           name:   profiles[u]?.name || u.slice(0, 8),
-          pts:    base + (phase === "general" ? bonus : 0),
+          pts:    base + (phase === "general" ? bonus : 0) + sBonus,
           exacts: countExacts(leaguePredictions, matchById, u, phase),
           sweeps,
           badge,
+          sBonus,
         };
       })
       .sort((x, y) => y.pts - x.pts || y.exacts - x.exacts);
-  }, [league.members, leaguePredictions, matchById, phase, profiles]);
+  }, [league.members, leaguePredictions, scorerPicks, matchGoals, matchById, phase, profiles]);
 
   async function handleRefresh() {
     setRefreshing(true);
@@ -1197,7 +1426,10 @@ function StandingsTab({ league }) {
                 </span>
               )}
             </div>
-            <div className="pm-rowexact">{r.exacts}× exacto</div>
+            <div className="pm-rowexact">
+              {r.exacts}× exacto
+              {r.sBonus > 0 && <span className="pm-scorer-bonus-badge">+{r.sBonus}⚽</span>}
+            </div>
             <div className="pm-rowpts">{r.pts}</div>
           </div>
         ))}
@@ -2067,4 +2299,34 @@ button:focus-visible,input:focus-visible{outline:2px solid #fff;outline-offset:2
 
 /* ---- Comic disabled placeholder ---- */
 .pm-btn-comic-disabled{opacity:.45;cursor:default;pointer-events:none;}
+
+/* ---- Scorer picker ---- */
+.pm-scorer-section{margin-top:14px;border-top:1px solid rgba(255,255,255,.08);padding-top:12px;}
+.pm-scorer-title{font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.07em;
+  color:rgba(255,255,255,.55);margin-bottom:8px;display:flex;align-items:center;gap:8px;}
+.pm-scorer-saved{font-weight:600;color:var(--accent2);font-size:12px;text-transform:none;letter-spacing:0;}
+.pm-scorer-pos-text{font-weight:400;opacity:.7;}
+.pm-scorer-search{padding:10px 12px;font-size:14px;margin-bottom:6px;}
+.pm-scorer-pending{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.12);
+  border-radius:12px;padding:10px 12px;display:flex;flex-direction:column;gap:8px;}
+.pm-scorer-pending-name{font-size:14px;font-weight:600;}
+.pm-scorer-pending-btns{display:flex;gap:8px;}
+.pm-scorer-list{max-height:200px;overflow-y:auto;display:flex;flex-direction:column;gap:2px;
+  scrollbar-width:thin;scrollbar-color:rgba(255,255,255,.2) transparent;}
+.pm-scorer-opt{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);
+  border-radius:10px;padding:8px 10px;display:flex;align-items:center;gap:8px;
+  cursor:pointer;text-align:left;color:#fff;font-size:13px;transition:background .12s;}
+.pm-scorer-opt:hover{background:rgba(255,255,255,.1);}
+.pm-scorer-opt.is-picked{background:rgba(255,200,50,.1);border-color:rgba(255,200,50,.35);}
+.pm-scorer-name{flex:1;font-size:13px;}
+.pm-scorer-pos-badge{font-size:10px;font-weight:800;width:18px;height:18px;border-radius:5px;
+  display:flex;align-items:center;justify-content:center;flex-shrink:0;}
+.pm-pos-goalkeeper{background:rgba(100,180,255,.25);color:#89cfff;}
+.pm-pos-defender{background:rgba(100,220,100,.2);color:#7de87d;}
+.pm-pos-midfielder{background:rgba(255,180,50,.2);color:#ffd070;}
+.pm-pos-attacker{background:rgba(255,80,80,.2);color:#ff9090;}
+.pm-scorer-num{font-size:11px;opacity:.45;}
+.pm-locked-scorer{font-size:12px;margin-top:4px;color:rgba(255,255,255,.65);display:flex;gap:5px;align-items:center;}
+.pm-scorer-bonus-badge{font-size:10px;font-weight:700;background:rgba(255,200,50,.2);
+  color:var(--accent2);border-radius:6px;padding:1px 5px;margin-left:4px;}
 `;

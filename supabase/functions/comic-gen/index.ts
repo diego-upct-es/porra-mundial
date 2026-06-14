@@ -59,12 +59,12 @@ Deno.serve(async (req: Request) => {
 
     // ── 2. Datos del día ──────────────────────────────────────────
     // match_day es la clave de jornada (09:00-09:00 Europe/Madrid).
-    // Ventana UTC conservadora: 06:00Z del día → 09:00Z del día siguiente.
-    // Cubre partidos nocturnos en América que caen antes de las 09:00 Madrid.
+    // Calculamos el UTC exacto de 09:00 Madrid para ese día y el siguiente
+    // usando la misma técnica DST-safe que jornadaKey() en poll-results.
     const [yy, mm, dd] = match_day.split("-").map(Number);
-    const nextDay = new Date(Date.UTC(yy, mm - 1, dd + 1)).toISOString().slice(0, 10);
-    const dayStart = `${match_day}T06:00:00Z`;
-    const dayEnd   = `${nextDay}T09:00:00Z`;
+    const nextDayStr = new Date(Date.UTC(yy, mm - 1, dd + 1)).toISOString().slice(0, 10);
+    const dayStart = madrid09UtcInstant(match_day).toISOString();
+    const dayEnd   = madrid09UtcInstant(nextDayStr).toISOString();
 
     const [
       { data: dayMatches, error: matchErr },
@@ -74,7 +74,7 @@ Deno.serve(async (req: Request) => {
         .select("id, home_team, away_team, home_goals, away_goals, kickoff")
         .eq("is_final", true)
         .gte("kickoff", dayStart)
-        .lte("kickoff", dayEnd),
+        .lt("kickoff",  dayEnd),  // exclusivo: dayEnd = inicio de la jornada siguiente
       supabase.from("league_members")
         .select("user_id, profiles(id, display_name, avatar_url)")
         .eq("league_id", league_id),
@@ -343,6 +343,40 @@ No extra panels. No watermarks. No text outside speech bubbles.`;
     return respond({ ok: false, error: err.message }, 500);
   }
 });
+
+// ── Helpers de jornada ────────────────────────────────────────
+
+/**
+ * Dado un "YYYY-MM-DD" en hora de Madrid, retorna el instante UTC exacto
+ * de las 09:00 de ese día en Madrid (DST-safe).
+ *
+ * Técnica: tomamos mediodía UTC como referencia neutral (no hay cambio de
+ * hora a mediodía), calculamos el offset Madrid-UTC de ese día y derivamos
+ * cuántos minutos UTC corresponden a las 09:00 Madrid.
+ *
+ * Ejemplos:
+ *   CEST (UTC+2): 09:00 Madrid = 07:00 UTC
+ *   CET  (UTC+1): 09:00 Madrid = 08:00 UTC
+ */
+function madrid09UtcInstant(dayStr: string): Date {
+  const noonRef = new Date(dayStr + "T12:00:00Z");
+  const parts = new Intl.DateTimeFormat("en-u-hc-h23", {
+    timeZone: "Europe/Madrid",
+    hour:     "2-digit",
+    minute:   "2-digit",
+  }).formatToParts(noonRef);
+  const madridH   = Number(parts.find(p => p.type === "hour")!.value);
+  const madridM   = Number(parts.find(p => p.type === "minute")!.value);
+  const offsetMin = madridH * 60 + madridM - 12 * 60; // e.g. 120 en CEST, 60 en CET
+  const utcMin    = 9 * 60 - offsetMin;               // e.g. 420 → 07:00 UTC en CEST
+  const utcH      = Math.floor(utcMin / 60);
+  const utcMm     = utcMin % 60;
+  return new Date(
+    dayStr + "T" +
+    String(utcH).padStart(2, "0") + ":" +
+    String(utcMm).padStart(2, "0") + ":00Z",
+  );
+}
 
 function respond(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body, null, 2), {
