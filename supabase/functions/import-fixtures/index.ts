@@ -11,13 +11,6 @@
  *   WC_SEASON       — Temporada (por defecto: 2026)
  *
  * Invocar manualmente:
- *   # Primera vez: borrar fixtures anteriores (IDs distintos) y recargar
- *   curl -X POST https://<ref>.supabase.co/functions/v1/import-fixtures \
- *        -H "Authorization: Bearer <anon-key>" \
- *        -H "Content-Type: application/json" \
- *        -d '{"truncate":true}'
- *
- *   # Actualizaciones posteriores (upsert sin borrar)
  *   curl -X POST https://<ref>.supabase.co/functions/v1/import-fixtures \
  *        -H "Authorization: Bearer <anon-key>"
  */
@@ -36,10 +29,6 @@ Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") return respond({ ok: true }, 200);
 
   try {
-    const body: Record<string, unknown> =
-      req.method === "POST" ? await req.json().catch(() => ({})) : {};
-    const truncate: boolean = body.truncate === true;
-
     // ── Secrets ───────────────────────────────────────────────
     const apiKey = Deno.env.get("APISPORTS_KEY");
     if (!apiKey) {
@@ -177,33 +166,24 @@ Deno.serve(async (req: Request) => {
         : parseRound(round);
 
       return {
-        id:         String(f.fixture.id),          // fixture.id de API-Football
-        phase:      isGroup ? "grupos" : "eliminatorias",
-        grp:        grpValue,
-        home_team:  f.teams?.home?.name  ?? "TBD",
-        away_team:  f.teams?.away?.name  ?? "TBD",
-        home_logo:  f.teams?.home?.logo  ?? null,  // URL de escudo real
-        away_logo:  f.teams?.away?.logo  ?? null,
-        kickoff:    f.fixture.date,                // ISO 8601 UTC
-        home_goals: homeGoals,
-        away_goals: awayGoals,
-        is_final:   isFinal,
-        updated_at: new Date().toISOString(),
+        id:           String(f.fixture.id),          // fixture.id de API-Football
+        phase:        isGroup ? "grupos" : "eliminatorias",
+        grp:          grpValue,
+        home_team:    f.teams?.home?.name  ?? "TBD",
+        away_team:    f.teams?.away?.name  ?? "TBD",
+        home_logo:    f.teams?.home?.logo  ?? null,  // URL de escudo real
+        away_logo:    f.teams?.away?.logo  ?? null,
+        home_team_id: f.teams?.home?.id    ?? null,  // para import-squads
+        away_team_id: f.teams?.away?.id    ?? null,
+        kickoff:      f.fixture.date,                // ISO 8601 UTC
+        home_goals:   homeGoals,
+        away_goals:   awayGoals,
+        is_final:     isFinal,
+        updated_at:   new Date().toISOString(),
       };
     });
 
-    // ── PASO 4 (opcional): Vaciar fixtures previos ───────────
-    // Necesario en la migración inicial porque los IDs de API-Football
-    // son distintos a los de football-data.org.
-    // Las predicciones también se eliminan (foreign key cascade).
-    if (truncate) {
-      console.log("[import] truncate=true — vaciando matches y predictions…");
-      const { data: tData, error: tErr } = await supabase.rpc("truncate_fixtures");
-      if (tErr) throw new Error(`truncate_fixtures RPC: ${tErr.message}`);
-      console.log("[import] Vaciado:", JSON.stringify(tData));
-    }
-
-    // ── PASO 5: Upsert en lotes de 50 ───────────────────────
+    // ── PASO 4: Upsert en lotes de 50 ───────────────────────
     let upserted = 0;
     for (let i = 0; i < rows.length; i += BATCH_SIZE) {
       const batch = rows.slice(i, i + BATCH_SIZE);

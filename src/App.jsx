@@ -4,8 +4,9 @@ import { supabase } from "./lib/supabase.js";
 
 /* ============================================================
    PORRA MUNDIAL 2026 — Frontend
-   Fase 5: poll-results automático + override de admin.
    ============================================================ */
+
+const APP_VERSION = "2.0";
 
 // ─── Contexto de usuario ──────────────────────────────────────
 // Proporciona datos globales a todos los componentes sin prop-drilling.
@@ -107,10 +108,14 @@ function formatKickoff(kickoff) {
   return `${day} · ${time}`;
 }
 
-/** Puntúa una predicción contra el resultado real del partido. */
+/** Puntúa una predicción contra el resultado real del partido.
+ *  Exacto normal → 3 pts. Exacto con goleada (≥4 goles totales) → 5 pts (+2 bonus).
+ *  Un acierto parcial → 1 pt. Fallo → 0. Sin resultado aún → null. */
 function scorePrediction(pred, match) {
   if (!match || match.home_goals === null || match.away_goals === null) return null;
-  if (pred.home_goals === match.home_goals && pred.away_goals === match.away_goals) return 3;
+  if (pred.home_goals === match.home_goals && pred.away_goals === match.away_goals) {
+    return (match.home_goals + match.away_goals) >= 4 ? 5 : 3;
+  }
   if (pred.home_goals === match.home_goals || pred.away_goals === match.away_goals) return 1;
   return 0;
 }
@@ -225,7 +230,8 @@ export default function App() {
   const [view,     setView]     = useState("home");
   const [leagueId, setLeagueId] = useState(null);
   const [tab,      setTab]      = useState("prediccion");
-  const [modal,    setModal]    = useState(null); // 'create' | 'join'
+  const [modal,         setModal]         = useState(null);  // 'create' | 'join'
+  const [showChangelog, setShowChangelog] = useState(false);
 
   // null = sin comprobar | 'granted' | 'denied' | 'unsupported'
   const [pushGranted, setPushGranted] = useState(null);
@@ -342,6 +348,10 @@ export default function App() {
     if (data) {
       setProfiles(prev => ({ ...prev, [userId]: { name: data.display_name, avatar_url: data.avatar_url || null } }));
       loadLeagues(userId);
+      // Mostrar changelog si el usuario no ha visto esta versión aún
+      if (data.last_seen_version !== APP_VERSION) {
+        setShowChangelog(true);
+      }
     }
   }
 
@@ -599,6 +609,14 @@ export default function App() {
   if (session === undefined) return <LoadingScreen />;
   if (!session || !profile)  return <AuthScreen />;
 
+  async function dismissChangelog() {
+    setShowChangelog(false);
+    const uid = session?.user.id;
+    if (!uid) return;
+    await supabase.from("profiles").update({ last_seen_version: APP_VERSION }).eq("id", uid);
+    setProfile(prev => prev ? { ...prev, last_seen_version: APP_VERSION } : prev);
+  }
+
   return (
     <UserContext.Provider value={{
       userId, profile, profiles,
@@ -606,6 +624,7 @@ export default function App() {
       leaguePredictions, myPredictions,
       refreshMatches: loadMatches,
       uploadAvatar,
+      pushGranted, pushError, subscribeToPush: subscribeToPush,
     }}>
       <div className="pm-root" style={themeVars(theme)}>
         <style>{CSS}</style>
@@ -640,6 +659,7 @@ export default function App() {
 
         {modal === "create" && <CreateModal onClose={() => setModal(null)} onCreate={createLeague} />}
         {modal === "join"   && <JoinModal   onClose={() => setModal(null)} onJoin={joinLeague} />}
+        {showChangelog && <ChangelogModal onClose={dismissChangelog} />}
       </div>
     </UserContext.Provider>
   );
@@ -765,7 +785,7 @@ function LeaguesHome({ leagues, loading, onOpen, onCreate, onJoin, onSignOut, pu
 
 /* ─── Vista de liga ───────────────────────────────────────── */
 function LeagueView({ league, theme, tab, setTab, onBack, upsertPrediction, setChampion, updateMatch, deleteLeague }) {
-  const { userId, myPredictions, matchById } = useUser();
+  const { userId, myPredictions, matchById, pushGranted, pushError, subscribeToPush } = useUser();
   const myLeaguePreds = myPredictions.filter(p => p.league_id === league.id);
   const myPts = totalPoints(myLeaguePreds, matchById, userId);
   const isAdmin = userId === league.admin_id;
@@ -791,6 +811,8 @@ function LeagueView({ league, theme, tab, setTab, onBack, upsertPrediction, setC
           </button>
         )}
       </header>
+
+      <NotifBanner pushGranted={pushGranted} pushError={pushError} onSubscribe={subscribeToPush} />
 
       <div className="pm-tabbody">
         {tab === "prediccion"    && <PredictionTab  league={league} upsertPrediction={upsertPrediction} setChampion={setChampion} />}
@@ -1097,11 +1119,9 @@ function StandingsTab({ league }) {
   const { userId, profiles, leaguePredictions, matchById, refreshMatches } = useUser();
   const [phase,       setPhase]       = useState("general");
   const [refreshing,  setRefreshing]  = useState(false);
-  // Viñeta más reciente para esta liga
-  const [comic,       setComic]       = useState(null); // { url, day } | null
-  const [comicState,  setComicState]  = useState("idle"); // "idle" | "loading" | "error"
-  const [comicErr,    setComicErr]    = useState("");
-  const [comicModal,  setComicModal]  = useState(false);
+  // Viñeta más reciente para esta liga (generada automáticamente por poll-results)
+  const [comic,      setComic]      = useState(null);   // { url, day } | null
+  const [comicModal, setComicModal] = useState(false);
 
   // Carga la viñeta más reciente al montar / cambiar de liga
   useEffect(() => {
@@ -1140,52 +1160,6 @@ function StandingsTab({ league }) {
     setRefreshing(true);
     await refreshMatches();
     setRefreshing(false);
-  }
-
-  // Generación manual (fallback si aún no existe viñeta automática)
-  async function handleGenerateComic() {
-    setComicState("loading");
-    setComicErr("");
-    const { data: { session } } = await supabase.auth.getSession();
-    if (!session) { setComicState("error"); setComicErr("Sin sesión activa."); return; }
-
-    // Busca el último día con partidos finalizados
-    const { data: lastMatch } = await supabase
-      .from("matches")
-      .select("kickoff")
-      .eq("is_final", true)
-      .order("kickoff", { ascending: false })
-      .limit(1)
-      .maybeSingle();
-
-    if (!lastMatch) { setComicState("error"); setComicErr("No hay partidos finalizados todavía."); return; }
-    const matchDay = lastMatch.kickoff.slice(0, 10);
-
-    try {
-      const res = await fetch(
-        `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/comic-gen`,
-        {
-          method:  "POST",
-          headers: { "Content-Type": "application/json", "Authorization": `Bearer ${session.access_token}` },
-          body:    JSON.stringify({ league_id: league.id, match_day: matchDay }),
-        }
-      );
-      const json = await res.json();
-      if (json.ok && json.url) {
-        setComic({ url: json.url, day: matchDay });
-        setComicState("idle");
-        setComicModal(true);
-      } else if (json.error === "image_model_unavailable") {
-        setComicState("error");
-        setComicErr(`Modelo de imagen no disponible. ${json.hint || ""}`);
-      } else {
-        setComicState("error");
-        setComicErr(json.error || "Error desconocido al generar la viñeta.");
-      }
-    } catch (e) {
-      setComicState("error");
-      setComicErr(e?.message || String(e));
-    }
   }
 
   function fmtDay(dateStr) {
@@ -1229,31 +1203,20 @@ function StandingsTab({ league }) {
         ))}
       </div>
 
-      {/* ── Viñeta del día ────────────────────────────────────── */}
+      {/* ── Viñeta de la jornada anterior ────────────────────── */}
       <div className="pm-comic-section">
         {comic?.url ? (
-          // Viñeta disponible: miniatura + botón
           <button className="pm-comic-thumb-btn" onClick={() => setComicModal(true)}>
             <img src={comic.url} alt="Viñeta del grupo" className="pm-comic-thumb" />
             <div className="pm-comic-thumb-meta">
-              <span className="pm-comic-thumb-label">🎨 Viñeta del grupo</span>
+              <span className="pm-comic-thumb-label">🎨 Viñeta de la jornada anterior</span>
               {comic.day && <span className="pm-comic-thumb-day">{fmtDay(comic.day)}</span>}
             </div>
           </button>
-        ) : comicState === "loading" ? (
-          <div className="pm-note pm-note-loading">🎨 Generando viñeta del grupo… (puede tardar 30-60 s)</div>
-        ) : comicState === "error" ? (
-          <>
-            <div className="pm-note" style={{ color: "rgba(255,100,100,.85)", marginBottom: 8 }}>{comicErr}</div>
-            <button className="pm-btn pm-btn-sm pm-btn-comic" onClick={handleGenerateComic}>
-              Reintentar
-            </button>
-          </>
         ) : (
-          // Sin viñeta todavía — generación automática o manual
-          <button className="pm-btn pm-btn-sm pm-btn-comic" onClick={handleGenerateComic}>
-            🎨 Mostrar viñeta del grupo
-          </button>
+          <div className="pm-btn pm-btn-sm pm-btn-comic pm-btn-comic-disabled" aria-disabled="true">
+            🎨 Viñeta disponible al terminar la jornada
+          </div>
         )}
       </div>
 
@@ -1766,6 +1729,83 @@ function Flag({ code, size = 18 }) {
   );
 }
 
+/* ─── NotifBanner ───────────────────────────────────────── */
+/**
+ * Banner de opt-in de notificaciones dentro de LeagueView.
+ * - Muestra instrucciones específicas de iOS si la app no está instalada como PWA.
+ * - Se oculta cuando ya está concedido o no es soportado.
+ */
+function NotifBanner({ pushGranted, pushError, onSubscribe }) {
+  const [dismissed, setDismissed] = useState(false);
+
+  // Oculto si ya está concedido, no soportado, o el usuario lo cerró
+  if (dismissed || pushGranted === "granted" || pushGranted === "unsupported") return null;
+
+  // Detección de iOS sin PWA instalada
+  const isIos = /iphone|ipad|ipod/i.test(navigator.userAgent);
+  const isPwa = typeof window !== "undefined" && (
+    window.matchMedia("(display-mode: standalone)").matches ||
+    ("standalone" in navigator && navigator.standalone === true)
+  );
+  const needsIosInstall = isIos && !isPwa;
+
+  return (
+    <div className="pm-notif-banner">
+      <button className="pm-notif-dismiss" onClick={() => setDismissed(true)} aria-label="Cerrar">✕</button>
+      {needsIosInstall ? (
+        <>
+          <div className="pm-notif-title">Activa los avisos de las 9:00</div>
+          <div className="pm-notif-body">
+            En iPhone: pulsa <strong>Compartir</strong> → <strong>Añadir a pantalla de inicio</strong>
+            {" "}y luego reabre la app desde el icono. Después podrás activar notificaciones.
+          </div>
+        </>
+      ) : pushGranted === "denied" ? (
+        <>
+          <div className="pm-notif-title">Notificaciones bloqueadas</div>
+          <div className="pm-notif-body">
+            Desbloquéalas en los ajustes del navegador para recibir el aviso diario de las 9:00.
+          </div>
+        </>
+      ) : (
+        <>
+          <div className="pm-notif-title">No te pierdas las predicciones</div>
+          <div className="pm-notif-body">Recibe un aviso cada día a las 9:00 con los partidos abiertos.</div>
+          <button className="pm-btn pm-btn-primary pm-notif-btn" onClick={onSubscribe}>
+            Activar avisos
+          </button>
+          {pushError && <div className="pm-notif-err">{pushError}</div>}
+        </>
+      )}
+    </div>
+  );
+}
+
+/* ─── ChangelogModal ─────────────────────────────────────── */
+function ChangelogModal({ onClose }) {
+  return (
+    <div className="pm-overlay" onClick={onClose}>
+      <div className="pm-modal pm-changelog-modal" onClick={e => e.stopPropagation()}>
+        <div className="pm-modal-head">
+          <h3>Novedades v2.0</h3>
+          <button className="pm-close" onClick={onClose}>✕</button>
+        </div>
+        <div className="pm-changelog-body">
+          <ul className="pm-changelog-list">
+            <li><strong>Bonus goleada</strong> — Exacto con ≥4 goles totales vale <em>+5 pts</em> (en lugar de +3).</li>
+            <li><strong>Goleador por partido</strong> — Elige quién marcará y suma puntos extra por posición.</li>
+            <li><strong>Viñeta automática</strong> — Se genera al cerrar cada jornada completa; aparece en Clasificación.</li>
+            <li><strong>Avisos mejorados</strong> — Banner de opt-in dentro de cada liga (con guía para iPhone).</li>
+          </ul>
+        </div>
+        <button className="pm-btn pm-btn-primary" style={{ margin: "0 16px 16px" }} onClick={onClose}>
+          Entendido
+        </button>
+      </div>
+    </div>
+  );
+}
+
 /* ─── CSS helpers ───────────────────────────────────────── */
 function themeVars(t) {
   return { ["--bg"]: t.bg, ["--deep"]: t.deep, ["--accent"]: t.accent, ["--accent2"]: t.accent2, ["--on"]: t.on };
@@ -2004,4 +2044,27 @@ button:focus-visible,input:focus-visible{outline:2px solid #fff;outline-offset:2
 .pm-push-btn:disabled{opacity:.45;cursor:default;}
 .pm-push-ok{text-align:center;font-size:13px;opacity:.6;padding:4px 0;}
 .pm-push-err{font-size:12px;color:#ff7a7a;background:rgba(255,80,80,.1);border-radius:12px;padding:10px 12px;}
+
+/* ---- NotifBanner ---- */
+.pm-notif-banner{position:relative;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.12);border-radius:14px;padding:13px 40px 13px 14px;margin:0 12px 8px;}
+.pm-notif-dismiss{position:absolute;top:9px;right:10px;background:none;border:none;color:rgba(255,255,255,.45);font-size:14px;cursor:pointer;line-height:1;padding:2px 4px;}
+.pm-notif-dismiss:hover{color:#fff;}
+.pm-notif-title{font-size:13px;font-weight:700;margin-bottom:4px;}
+.pm-notif-body{font-size:12px;opacity:.75;line-height:1.45;margin-bottom:8px;}
+.pm-notif-btn{padding:9px 18px;font-size:13px;}
+.pm-notif-err{font-size:11px;color:#ff7a7a;margin-top:6px;}
+
+/* ---- ChangelogModal ---- */
+.pm-changelog-modal{max-height:80vh;overflow-y:auto;}
+.pm-changelog-body{padding:0 2px 10px;}
+.pm-changelog-list{margin:0;padding:0 0 0 18px;display:flex;flex-direction:column;gap:10px;}
+.pm-changelog-list li{font-size:14px;line-height:1.5;color:rgba(255,255,255,.85);}
+.pm-changelog-list strong{color:#fff;}
+.pm-changelog-list em{color:var(--accent2);font-style:normal;font-weight:700;}
+
+/* ---- Goleada bonus ---- */
+.pm-pts-5{color:var(--accent2);font-weight:800;}
+
+/* ---- Comic disabled placeholder ---- */
+.pm-btn-comic-disabled{opacity:.45;cursor:default;pointer-events:none;}
 `;

@@ -18,8 +18,8 @@
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-const TEXT_MODEL  = "gemini-2.5-flash";           // texto: descripción de escena
-const IMAGE_MODEL = "gemini-2.5-flash-image";     // imagen: Nano Banana (gratuito, ref-images OK)
+const TEXT_MODEL  = "gemini-2.5-flash";              // texto: descripción de escena
+const IMAGE_MODEL = "gemini-3-pro-image-preview";  // imagen: viñeta del grupo
 const GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta";
 
 Deno.serve(async (req: Request) => {
@@ -58,8 +58,13 @@ Deno.serve(async (req: Request) => {
     }
 
     // ── 2. Datos del día ──────────────────────────────────────────
-    const dayStart = `${match_day}T00:00:00Z`;
-    const dayEnd   = `${match_day}T23:59:59Z`;
+    // match_day es la clave de jornada (09:00-09:00 Europe/Madrid).
+    // Ventana UTC conservadora: 06:00Z del día → 09:00Z del día siguiente.
+    // Cubre partidos nocturnos en América que caen antes de las 09:00 Madrid.
+    const [yy, mm, dd] = match_day.split("-").map(Number);
+    const nextDay = new Date(Date.UTC(yy, mm - 1, dd + 1)).toISOString().slice(0, 10);
+    const dayStart = `${match_day}T06:00:00Z`;
+    const dayEnd   = `${nextDay}T09:00:00Z`;
 
     const [
       { data: dayMatches, error: matchErr },

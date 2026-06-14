@@ -1,16 +1,14 @@
 /**
- * poll-results — Actualiza resultados desde API-Football (api-sports.io v3)
+ * poll-results — Actualiza resultados y goles desde API-Football (api-sports.io v3)
  *
  * Cada 30 min (cron):
  *   1. Descarga fixtures del día anterior y del día actual en Europe/Madrid
  *   2. Actualiza home_goals, away_goals, is_final en matches
- *   3. Detecta jornadas completas (todos los partidos de un día Madrid
- *      ya están finalizados) y dispara comic-gen en paralelo para cada
- *      liga activa que no tenga viñeta de ese día.
+ *   3. Para los partidos recién finalizados, upserta goles en match_goals
+ *   4. Detecta jornadas completas (ventana 09:00-09:00 Europe/Madrid) y dispara
+ *      comic-gen en paralelo para cada liga activa que no tenga viñeta de ese día.
  *
  * Secrets: APISPORTS_KEY, WC_LEAGUE_ID (default 1), WC_SEASON (default 2026)
- *
- * Nota: la actualización de goleadores se gestiona en un step separado.
  */
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
@@ -46,18 +44,13 @@ Deno.serve(async (req: Request) => {
     const now = new Date();
 
     // ── Calcular ventana en Europe/Madrid ────────────────────
-    // Tomamos el día anterior y el actual en horario de Madrid para
-    // cubrir los partidos que empezaron ayer en Madrid pero aún
-    // pueden estar sin finalizar (p.ej. un partido de las 23:00 Madrid).
     const todayMadrid     = madridDateStr(now);
     const yesterdayDate   = new Date(now);
     yesterdayDate.setUTCDate(yesterdayDate.getUTCDate() - 1);
     const yesterdayMadrid = madridDateStr(yesterdayDate);
 
-    // Para la query a la API usamos fechas UTC con un día de margen
-    // (API-Football filtra por fixture.date que está en UTC).
-    const dateFrom = yesterdayMadrid; // ayer Madrid ≈ ayer UTC (pequeño desfase OK)
-    const dateTo   = todayMadrid;     // hoy Madrid ≈ hoy UTC
+    const dateFrom = yesterdayMadrid;
+    const dateTo   = todayMadrid;
 
     console.log(`[poll] Ventana: ${dateFrom} → ${dateTo} (Europe/Madrid)`);
 
@@ -66,8 +59,10 @@ Deno.serve(async (req: Request) => {
     const fxRes = await fetch(url, { headers: apiHeaders });
 
     let matchesResult: Record<string, unknown> = { window: { from: dateFrom, to: dateTo } };
-    // Días Madrid cuya jornada ha quedado completamente finalizada en esta ejecución
+    // Jornadas Madrid (09:00-09:00) recién completadas
     const newlyFinishedDays: string[] = [];
+    // IDs de partidos recién marcados is_final (para buscar eventos de goles)
+    const newlyFinishedIds: string[] = [];
 
     if (!fxRes.ok) {
       const body = await fxRes.text();
@@ -79,9 +74,9 @@ Deno.serve(async (req: Request) => {
 
       let updated = 0, errors = 0;
 
-      // Agrupa por día Madrid (para detectar jornadas completas)
-      // key = "YYYY-MM-DD" en Europe/Madrid
-      const byDay: Record<string, { total: number; finalCount: number }> = {};
+      // Agrupa por jornada (09:00-09:00 Europe/Madrid)
+      // key = "YYYY-MM-DD" de la jornada a la que pertenece el partido
+      const byJornada: Record<string, { total: number; finalCount: number }> = {};
 
       for (const f of fixtures) {
         const status  = (f.fixture?.status?.short ?? "NS") as string;
@@ -92,13 +87,15 @@ Deno.serve(async (req: Request) => {
         const homeGoals = isStarted ? (f.goals?.home  ?? null) : null;
         const awayGoals = isStarted ? (f.goals?.away  ?? null) : null;
 
-        // Día en Madrid del kickoff UTC
+        // Jornada (09:00-09:00 Madrid) del kickoff UTC
         const kickoffUTC = new Date(f.fixture.date);
-        const day = madridDateStr(kickoffUTC);
+        const jday = jornadaKey(kickoffUTC);
 
-        if (!byDay[day]) byDay[day] = { total: 0, finalCount: 0 };
-        byDay[day].total++;
-        if (isFinal) byDay[day].finalCount++;
+        if (!byJornada[jday]) byJornada[jday] = { total: 0, finalCount: 0 };
+        byJornada[jday].total++;
+        if (isFinal) byJornada[jday].finalCount++;
+
+        const fixtureId = String(f.fixture.id);
 
         const { error } = await supabase
           .from("matches")
@@ -108,32 +105,105 @@ Deno.serve(async (req: Request) => {
             is_final:   isFinal,
             updated_at: now.toISOString(),
           })
-          .eq("id", String(f.fixture.id));
+          .eq("id", fixtureId)
+          .eq("is_final", false);  // solo actualiza si aún no era final (evita re-fetch de eventos)
 
         if (error) {
-          // El partido puede no existir si import-fixtures aún no se ha ejecutado.
-          console.error(`[poll] partido ${f.fixture.id}:`, error.message);
-          errors++;
+          // .eq("is_final",false) filtra filas ya finales → error o 0 rows → no es crítico.
+          // Puede ser que el partido no exista (import-fixtures aún no ejecutado).
+          if (!error.message.includes("0 rows")) {
+            console.error(`[poll] partido ${fixtureId}:`, error.message);
+            errors++;
+          }
         } else {
           updated++;
+          if (isFinal) newlyFinishedIds.push(fixtureId);
+        }
+      }
+
+      // Actualiza también partidos ya-final (solo goals, no is_final) para cubrir correcciones
+      for (const f of fixtures) {
+        const status  = (f.fixture?.status?.short ?? "NS") as string;
+        const isFinal = FINAL_STATUSES.has(status);
+        if (!isFinal) continue;
+        const fixtureId = String(f.fixture.id);
+        await supabase
+          .from("matches")
+          .update({
+            home_goals: f.goals?.home ?? null,
+            away_goals: f.goals?.away ?? null,
+            is_final:   true,
+            updated_at: now.toISOString(),
+          })
+          .eq("id", fixtureId)
+          .eq("is_final", true);
+      }
+
+      // ── Goles de los partidos recién finalizados ──────────
+      // Llama a /fixtures/events solo si match_goals aún no tiene entradas.
+      if (newlyFinishedIds.length > 0) {
+        console.log(`[poll] Buscando goles de ${newlyFinishedIds.length} partido(s) nuevo(s)…`);
+        for (const matchId of newlyFinishedIds) {
+          // Idempotencia: si ya hay goles guardados, no re-fetch
+          const { count } = await supabase
+            .from("match_goals")
+            .select("*", { count: "exact", head: true })
+            .eq("match_id", matchId);
+
+          if ((count ?? 0) > 0) {
+            console.log(`[poll] match ${matchId}: goles ya registrados — skip`);
+            continue;
+          }
+
+          const evUrl = `${API_BASE}/fixtures/events?fixture=${matchId}&type=Goal`;
+          const evRes = await fetch(evUrl, { headers: apiHeaders });
+          if (!evRes.ok) {
+            console.error(`[poll] events ${matchId}: HTTP ${evRes.status}`);
+            continue;
+          }
+          const evJson  = await evRes.json();
+          const events: any[] = evJson.response ?? [];
+
+          const goalRows = events
+            .filter((e: any) => e.detail !== "Missed Penalty")
+            .map((e: any) => ({
+              match_id:      matchId,
+              ext_player_id: e.player?.id   ?? 0,
+              player_name:   e.player?.name ?? "Desconocido",
+              team_id:       e.team?.id     ?? 0,
+              minute:        e.time?.elapsed ?? 0,
+              is_own_goal:   e.detail === "Own Goal",
+            }));
+
+          if (goalRows.length > 0) {
+            const { error: goalErr } = await supabase
+              .from("match_goals")
+              .upsert(goalRows, { onConflict: "match_id,ext_player_id,minute" });
+            if (goalErr) {
+              console.error(`[poll] match_goals upsert ${matchId}:`, goalErr.message);
+            } else {
+              console.log(`[poll] match ${matchId}: ${goalRows.length} gol(es) registrados`);
+            }
+          } else {
+            console.log(`[poll] match ${matchId}: sin goles en la respuesta`);
+          }
+
+          // Pausa mínima para no saturar la cuota
+          await new Promise(r => setTimeout(r, 80));
         }
       }
 
       // ── Detectar jornadas Madrid recién completadas ───────
-      // Para cada día con partidos en la ventana, verificamos en la BD que
-      // TODOS los partidos de ese día (no solo los devueltos por la API)
-      // son ya is_final. Esto evita falsos positivos si la API devuelve
-      // una ventana parcial.
-      for (const [day] of Object.entries(byDay)) {
-        // Buscamos en la BD todos los partidos cuyo kickoff cae en ese día Madrid
-        // usando una ventana UTC conservadora: D-1T20:00Z → D+1T04:00Z
-        const refDate   = new Date(day + "T12:00:00Z");
-        const winStart  = new Date(refDate);
-        const winEnd    = new Date(refDate);
+      for (const [jday] of Object.entries(byJornada)) {
+        // Ventana UTC conservadora para la jornada (09:00-09:00 Madrid):
+        // del día anterior a las 20:00 UTC hasta el día siguiente a las 10:00 UTC
+        const refDate  = new Date(jday + "T12:00:00Z");
+        const winStart = new Date(refDate);
+        const winEnd   = new Date(refDate);
         winStart.setUTCDate(winStart.getUTCDate() - 1);
         winStart.setUTCHours(20, 0, 0, 0);
         winEnd.setUTCDate(winEnd.getUTCDate() + 1);
-        winEnd.setUTCHours(4, 0, 0, 0);
+        winEnd.setUTCHours(10, 0, 0, 0);  // 10 UTC cubre 09:00 Madrid en cualquier DST
 
         const { data: dayRows } = await supabase
           .from("matches")
@@ -141,16 +211,16 @@ Deno.serve(async (req: Request) => {
           .gte("kickoff", winStart.toISOString())
           .lt("kickoff",  winEnd.toISOString());
 
-        // Filtrar solo los que caen en este día Madrid exacto
-        const dayMatches = (dayRows ?? []).filter(
-          (m: any) => madridDateStr(new Date(m.kickoff)) === day,
+        // Filtrar solo los que pertenecen a esta jornada exacta
+        const jornadaMatches = (dayRows ?? []).filter(
+          (m: any) => jornadaKey(new Date(m.kickoff)) === jday,
         );
 
-        if (dayMatches.length > 0 && dayMatches.every((m: any) => m.is_final)) {
-          newlyFinishedDays.push(day);
+        if (jornadaMatches.length > 0 && jornadaMatches.every((m: any) => m.is_final)) {
+          newlyFinishedDays.push(jday);
           console.log(
-            `[poll] Jornada ${day} (Madrid) completa: ` +
-            `${dayMatches.length} partidos finalizados.`,
+            `[poll] Jornada ${jday} (Madrid 09-09) completa: ` +
+            `${jornadaMatches.length} partidos finalizados.`,
           );
         }
       }
@@ -164,12 +234,11 @@ Deno.serve(async (req: Request) => {
         in_window: fixtures.length,
         updated,
         errors,
+        new_goals_matches: newlyFinishedIds.length,
       };
     }
 
     // ── Auto-generación de viñetas ────────────────────────────
-    // Se mantiene igual: cuando una jornada queda completamente finalizada,
-    // se dispara comic-gen para cada liga que aún no tenga viñeta de ese día.
     let comicsResult: Record<string, unknown> = { triggered: 0 };
 
     if (newlyFinishedDays.length > 0) {
@@ -278,6 +347,27 @@ function madridDateStr(date: Date): string {
   const m = parts.find(p => p.type === "month")!.value;
   const d = parts.find(p => p.type === "day")!.value;
   return `${y}-${m}-${d}`;
+}
+
+/**
+ * Clave de jornada (09:00-09:00 Europe/Madrid).
+ * Antes de las 09:00 Madrid → pertenece a la jornada del día anterior.
+ * Así, un partido a las 01:00 Madrid del día D+1 cuenta para la jornada D.
+ */
+function jornadaKey(date: Date): string {
+  const parts = new Intl.DateTimeFormat("en-u-hc-h23", {
+    timeZone: "Europe/Madrid",
+    hour:     "2-digit",
+  }).formatToParts(date);
+  const h = Number(parts.find(p => p.type === "hour")!.value);
+
+  if (h < 9) {
+    // Antes de las 09:00 Madrid → jornada del día anterior
+    const prev = new Date(date);
+    prev.setUTCDate(prev.getUTCDate() - 1);
+    return madridDateStr(prev);
+  }
+  return madridDateStr(date);
 }
 
 function respond(body: unknown, status = 200): Response {
