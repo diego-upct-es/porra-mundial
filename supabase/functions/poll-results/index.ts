@@ -1,73 +1,101 @@
 /**
- * poll-results — Fase 5 + 6 + auto-comic
+ * poll-results — Actualiza resultados desde API-Football (api-sports.io v3)
  *
- * Cada 30 min:
- *   1. Actualiza resultados del día ± 1 desde football-data.org
- *   2. Actualiza goleadores
- *   3. Detecta si alguna jornada acaba de quedar completa (todos is_final)
- *      y, si no existe viñeta para ese día, dispara comic-gen en paralelo
- *      para cada liga activa.
+ * Cada 30 min (cron):
+ *   1. Descarga fixtures del día anterior y del día actual en Europe/Madrid
+ *   2. Actualiza home_goals, away_goals, is_final en matches
+ *   3. Detecta jornadas completas (todos los partidos de un día Madrid
+ *      ya están finalizados) y dispara comic-gen en paralelo para cada
+ *      liga activa que no tenga viñeta de ese día.
+ *
+ * Secrets: APISPORTS_KEY, WC_LEAGUE_ID (default 1), WC_SEASON (default 2026)
+ *
+ * Nota: la actualización de goleadores se gestiona en un step separado.
  */
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-const API_BASE = "https://api.football-data.org/v4";
+const API_BASE = "https://v3.football.api-sports.io";
+
+// Statuses terminados definitivamente
+const FINAL_STATUSES = new Set(["FT", "AET", "PEN", "AWD", "WO"]);
+// Statuses en curso
+const LIVE_STATUSES  = new Set(["1H", "HT", "2H", "ET", "BT", "P", "SUSP", "INT", "LIVE"]);
 
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") return respond({ ok: true }, 200);
 
   try {
-    const token = Deno.env.get("FOOTBALL_DATA_TOKEN");
-    if (!token) {
+    const apiKey = Deno.env.get("APISPORTS_KEY");
+    if (!apiKey) {
       throw new Error(
-        "Secret FOOTBALL_DATA_TOKEN no configurado. " +
-          "Ejecuta: npx supabase secrets set FOOTBALL_DATA_TOKEN=<tu-token>",
+        "Secret APISPORTS_KEY no configurado. " +
+        "Ejecuta: npx supabase secrets set APISPORTS_KEY=<tu-key>",
       );
     }
+
+    const leagueId = Deno.env.get("WC_LEAGUE_ID") ?? "1";
+    const season   = Deno.env.get("WC_SEASON")    ?? "2026";
 
     const supabase = createClient(
       Deno.env.get("SUPABASE_URL")!,
       Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
     );
 
-    // ── LLAMADA 1: Resultados del día ± 1 ────────────────────────
-    const now       = new Date();
-    const yesterday = new Date(now); yesterday.setUTCDate(yesterday.getUTCDate() - 1);
-    const tomorrow  = new Date(now); tomorrow.setUTCDate(tomorrow.getUTCDate() + 1);
-    const dateFrom  = yesterday.toISOString().slice(0, 10);
-    const dateTo    = tomorrow.toISOString().slice(0, 10);
+    const apiHeaders = { "x-apisports-key": apiKey };
+    const now = new Date();
 
-    console.log(`[matches] Consultando ${dateFrom} → ${dateTo}…`);
+    // ── Calcular ventana en Europe/Madrid ────────────────────
+    // Tomamos el día anterior y el actual en horario de Madrid para
+    // cubrir los partidos que empezaron ayer en Madrid pero aún
+    // pueden estar sin finalizar (p.ej. un partido de las 23:00 Madrid).
+    const todayMadrid     = madridDateStr(now);
+    const yesterdayDate   = new Date(now);
+    yesterdayDate.setUTCDate(yesterdayDate.getUTCDate() - 1);
+    const yesterdayMadrid = madridDateStr(yesterdayDate);
 
-    const matchRes = await fetch(
-      `${API_BASE}/competitions/WC/matches?dateFrom=${dateFrom}&dateTo=${dateTo}`,
-      { headers: { "X-Auth-Token": token } },
-    );
+    // Para la query a la API usamos fechas UTC con un día de margen
+    // (API-Football filtra por fixture.date que está en UTC).
+    const dateFrom = yesterdayMadrid; // ayer Madrid ≈ ayer UTC (pequeño desfase OK)
+    const dateTo   = todayMadrid;     // hoy Madrid ≈ hoy UTC
 
-    let matchesResult: Record<string, unknown> = { window: { dateFrom, dateTo } };
-    // Días recién completados en esta ejecución (todos sus partidos is_final)
+    console.log(`[poll] Ventana: ${dateFrom} → ${dateTo} (Europe/Madrid)`);
+
+    // ── LLAMADA: fixtures de la ventana ──────────────────────
+    const url = `${API_BASE}/fixtures?league=${leagueId}&season=${season}&from=${dateFrom}&to=${dateTo}`;
+    const fxRes = await fetch(url, { headers: apiHeaders });
+
+    let matchesResult: Record<string, unknown> = { window: { from: dateFrom, to: dateTo } };
+    // Días Madrid cuya jornada ha quedado completamente finalizada en esta ejecución
     const newlyFinishedDays: string[] = [];
 
-    if (!matchRes.ok) {
-      const body = await matchRes.text();
-      matchesResult = { error: `HTTP ${matchRes.status}: ${body}` };
-      console.error("[matches] Error:", matchesResult.error);
+    if (!fxRes.ok) {
+      const body = await fxRes.text();
+      matchesResult = { error: `HTTP ${fxRes.status}: ${body.slice(0, 200)}` };
+      console.error("[poll] Error API:", matchesResult.error);
     } else {
-      const json: any      = await matchRes.json();
-      const matches: any[] = json.matches ?? [];
-      let updated = 0, errors = 0;
-      const finished: string[] = [];
+      const fxJson = await fxRes.json();
+      const fixtures: any[] = fxJson.response ?? [];
 
-      // Agrupa partidos de la ventana por día (para detectar jornadas completas)
+      let updated = 0, errors = 0;
+
+      // Agrupa por día Madrid (para detectar jornadas completas)
+      // key = "YYYY-MM-DD" en Europe/Madrid
       const byDay: Record<string, { total: number; finalCount: number }> = {};
 
-      for (const m of matches) {
-        const day       = (m.utcDate as string).slice(0, 10);
-        const homeGoals = m.score?.fullTime?.home ?? null;
-        const awayGoals = m.score?.fullTime?.away ?? null;
-        const isFinal   = m.status === "FINISHED";
+      for (const f of fixtures) {
+        const status  = (f.fixture?.status?.short ?? "NS") as string;
+        const isFinal = FINAL_STATUSES.has(status);
+        const isLive  = LIVE_STATUSES.has(status);
 
-        // Acumular stats por día
+        const isStarted = isFinal || isLive;
+        const homeGoals = isStarted ? (f.goals?.home  ?? null) : null;
+        const awayGoals = isStarted ? (f.goals?.away  ?? null) : null;
+
+        // Día en Madrid del kickoff UTC
+        const kickoffUTC = new Date(f.fixture.date);
+        const day = madridDateStr(kickoffUTC);
+
         if (!byDay[day]) byDay[day] = { total: 0, finalCount: 0 };
         byDay[day].total++;
         if (isFinal) byDay[day].finalCount++;
@@ -80,76 +108,68 @@ Deno.serve(async (req: Request) => {
             is_final:   isFinal,
             updated_at: now.toISOString(),
           })
-          .eq("id", String(m.id));
+          .eq("id", String(f.fixture.id));
 
-        if (error) { console.error(`[matches] partido ${m.id}:`, error.message); errors++; }
-        else {
+        if (error) {
+          // El partido puede no existir si import-fixtures aún no se ha ejecutado.
+          console.error(`[poll] partido ${f.fixture.id}:`, error.message);
+          errors++;
+        } else {
           updated++;
-          if (isFinal && homeGoals !== null) {
-            finished.push(`${m.homeTeam?.name ?? m.id} ${homeGoals}–${awayGoals} ${m.awayTeam?.name ?? ""}`);
-          }
         }
       }
 
-      // Detectar días en la ventana donde TODOS los partidos ya son finales
-      for (const [day, { total, finalCount }] of Object.entries(byDay)) {
-        if (total > 0 && total === finalCount) {
+      // ── Detectar jornadas Madrid recién completadas ───────
+      // Para cada día con partidos en la ventana, verificamos en la BD que
+      // TODOS los partidos de ese día (no solo los devueltos por la API)
+      // son ya is_final. Esto evita falsos positivos si la API devuelve
+      // una ventana parcial.
+      for (const [day] of Object.entries(byDay)) {
+        // Buscamos en la BD todos los partidos cuyo kickoff cae en ese día Madrid
+        // usando una ventana UTC conservadora: D-1T20:00Z → D+1T04:00Z
+        const refDate   = new Date(day + "T12:00:00Z");
+        const winStart  = new Date(refDate);
+        const winEnd    = new Date(refDate);
+        winStart.setUTCDate(winStart.getUTCDate() - 1);
+        winStart.setUTCHours(20, 0, 0, 0);
+        winEnd.setUTCDate(winEnd.getUTCDate() + 1);
+        winEnd.setUTCHours(4, 0, 0, 0);
+
+        const { data: dayRows } = await supabase
+          .from("matches")
+          .select("id, is_final, kickoff")
+          .gte("kickoff", winStart.toISOString())
+          .lt("kickoff",  winEnd.toISOString());
+
+        // Filtrar solo los que caen en este día Madrid exacto
+        const dayMatches = (dayRows ?? []).filter(
+          (m: any) => madridDateStr(new Date(m.kickoff)) === day,
+        );
+
+        if (dayMatches.length > 0 && dayMatches.every((m: any) => m.is_final)) {
           newlyFinishedDays.push(day);
-          console.log(`[matches] Jornada ${day} completada: ${total}/${total} partidos finales.`);
+          console.log(
+            `[poll] Jornada ${day} (Madrid) completa: ` +
+            `${dayMatches.length} partidos finalizados.`,
+          );
         }
       }
 
-      console.log(`[matches] ${updated} actualizados, ${errors} errores.`);
-      matchesResult = { window: { dateFrom, dateTo }, in_window: matches.length, updated, errors, finished };
-    }
-
-    // ── LLAMADA 2: Goleadores del Mundial ─────────────────────────
-    console.log("[scorers] Consultando máximos goleadores…");
-
-    let scorersResult: Record<string, unknown> = {};
-
-    try {
-      const scorersRes = await fetch(
-        `${API_BASE}/competitions/WC/scorers?limit=50`,
-        { headers: { "X-Auth-Token": token } },
+      console.log(
+        `[poll] ${updated} actualizados, ${errors} errores. ` +
+        `${fixtures.length} fixtures en ventana.`,
       );
-
-      if (!scorersRes.ok) {
-        const body = await scorersRes.text();
-        throw new Error(`HTTP ${scorersRes.status}: ${body}`);
-      }
-
-      const scorersJson: any = await scorersRes.json();
-      const scorers: any[]   = scorersJson.scorers ?? [];
-
-      if (scorers.length > 0) {
-        const rows = scorers.map((s: any) => ({
-          ext_player_id: s.player?.id ?? null,
-          player_name:   s.player?.name ?? "Desconocido",
-          team:          s.team?.name   ?? "",
-          team_logo:     s.team?.crest  ?? null,
-          goals:         s.goals ?? 0,
-          assists:       0,
-          updated_at:    now.toISOString(),
-        })).filter((r: any) => r.ext_player_id !== null);
-
-        const { error } = await supabase
-          .from("player_stats")
-          .upsert(rows, { onConflict: "ext_player_id" });
-
-        if (error) throw new Error(error.message);
-
-        console.log(`[scorers] ${rows.length} goleadores actualizados.`);
-        scorersResult = { upserted: rows.length, top: rows.slice(0, 3).map(r => `${r.player_name} ${r.goals}g`) };
-      } else {
-        scorersResult = { upserted: 0, message: "Sin goleadores todavía." };
-      }
-    } catch (scorerErr: any) {
-      console.error("[scorers] Error:", scorerErr.message);
-      scorersResult = { error: scorerErr.message };
+      matchesResult = {
+        window:    { from: dateFrom, to: dateTo },
+        in_window: fixtures.length,
+        updated,
+        errors,
+      };
     }
 
-    // ── LLAMADA 3: Auto-generación de viñetas ─────────────────────
+    // ── Auto-generación de viñetas ────────────────────────────
+    // Se mantiene igual: cuando una jornada queda completamente finalizada,
+    // se dispara comic-gen para cada liga que aún no tenga viñeta de ese día.
     let comicsResult: Record<string, unknown> = { triggered: 0 };
 
     if (newlyFinishedDays.length > 0) {
@@ -158,14 +178,11 @@ Deno.serve(async (req: Request) => {
         console.log("[comics] GEMINI_API_KEY no configurado, saltando auto-comic.");
         comicsResult = { skipped: "GEMINI_API_KEY no configurado" };
       } else {
-        // Ligas activas (con miembros)
         const { data: leagues } = await supabase
           .from("leagues")
           .select("id, name");
-
         const leagueList: { id: string; name: string }[] = leagues ?? [];
 
-        // Para cada par (liga, día recién terminado), verificar si ya hay viñeta
         const pending: { league_id: string; league_name: string; match_day: string }[] = [];
 
         for (const day of newlyFinishedDays) {
@@ -175,7 +192,9 @@ Deno.serve(async (req: Request) => {
             .eq("match_day", day)
             .in("league_id", leagueList.map(l => l.id));
 
-          const alreadyDone = new Set((existingComics ?? []).map((c: any) => c.league_id));
+          const alreadyDone = new Set(
+            (existingComics ?? []).map((c: any) => c.league_id),
+          );
 
           for (const lg of leagueList) {
             if (!alreadyDone.has(lg.id)) {
@@ -185,15 +204,17 @@ Deno.serve(async (req: Request) => {
         }
 
         if (pending.length === 0) {
-          console.log("[comics] Todas las viñetas ya existen. Nada que generar.");
+          console.log("[comics] Todas las viñetas ya existen.");
           comicsResult = { triggered: 0, message: "Viñetas ya existentes." };
         } else {
-          console.log(`[comics] Disparando ${pending.length} viñeta(s): ${pending.map(p => `${p.league_name}/${p.match_day}`).join(", ")}`);
+          console.log(
+            `[comics] Disparando ${pending.length} viñeta(s): ` +
+            pending.map(p => `${p.league_name}/${p.match_day}`).join(", "),
+          );
 
           const comicGenUrl = `${Deno.env.get("SUPABASE_URL")}/functions/v1/comic-gen`;
           const serviceKey  = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-          // Lanzar en paralelo (fire-and-await: es un job nocturno, el tiempo no importa)
           const comicResults = await Promise.allSettled(
             pending.map(async ({ league_id, league_name, match_day }) => {
               try {
@@ -207,7 +228,7 @@ Deno.serve(async (req: Request) => {
                 });
                 const json = await res.json();
                 if (json.ok) {
-                  console.log(`[comics] ✓ ${league_name}/${match_day}: ${json.url?.slice(-30)}`);
+                  console.log(`[comics] ✓ ${league_name}/${match_day}`);
                 } else if (json.cached) {
                   console.log(`[comics] cached ${league_name}/${match_day}`);
                 } else {
@@ -215,37 +236,55 @@ Deno.serve(async (req: Request) => {
                 }
                 return json;
               } catch (e: any) {
-                console.error(`[comics] fetch error ${league_name}/${match_day}:`, e.message);
+                console.error(
+                  `[comics] fetch error ${league_name}/${match_day}:`, e.message,
+                );
                 return { ok: false, error: e.message };
               }
-            })
+            }),
           );
 
-          const ok  = comicResults.filter(r => r.status === "fulfilled" && (r.value as any)?.ok).length;
+          const ok  = comicResults.filter(
+            r => r.status === "fulfilled" && (r.value as any)?.ok,
+          ).length;
           const err = comicResults.length - ok;
           comicsResult = { triggered: comicResults.length, ok, errors: err };
         }
       }
     }
 
-    return respond({
-      ok:      true,
-      matches: matchesResult,
-      scorers: scorersResult,
-      comics:  comicsResult,
-    });
+    return respond({ ok: true, matches: matchesResult, comics: comicsResult });
 
   } catch (err: any) {
-    console.error("poll-results error:", err);
+    console.error("[poll] error fatal:", err);
     return respond({ ok: false, error: err.message }, 500);
   }
 });
+
+// ── Helpers ───────────────────────────────────────────────────
+
+/**
+ * Devuelve "YYYY-MM-DD" para la fecha dada en Europe/Madrid.
+ * DST-safe: usa Intl.DateTimeFormat con en-CA (que da formato ISO).
+ */
+function madridDateStr(date: Date): string {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Europe/Madrid",
+    year:  "numeric",
+    month: "2-digit",
+    day:   "2-digit",
+  }).formatToParts(date);
+  const y = parts.find(p => p.type === "year")!.value;
+  const m = parts.find(p => p.type === "month")!.value;
+  const d = parts.find(p => p.type === "day")!.value;
+  return `${y}-${m}-${d}`;
+}
 
 function respond(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body, null, 2), {
     status,
     headers: {
-      "Content-Type": "application/json",
+      "Content-Type":                "application/json",
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Headers":
         "authorization, x-client-info, apikey, content-type",

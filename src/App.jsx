@@ -41,18 +41,62 @@ const ISO2 = {
  * Calcula el estado del partido a partir de sus datos reales de la DB.
  * - finished: is_final = true
  * - locked:   kickoff pasado pero aún no finalizado
- * - open:     kickoff futuro dentro de la ventana hoy + mañana
- * - soon:     kickoff futuro más allá de mañana
+ * - open:     kickoff dentro de la jornada activa (09:00 hoy → 09:00 mañana, Europe/Madrid)
+ * - soon:     kickoff más allá del corte de mañana
+ *
+ * La ventana avanza a las 09:00 hora de Madrid (DST-safe).
+ * Unifica el concepto de jornada para predicción, viñeta y aviso.
  */
 function getMatchState(m) {
   if (m.is_final) return "finished";
-  const now = new Date();
+  const now     = new Date();
   const kickoff = new Date(m.kickoff);
   if (kickoff <= now) return "locked";
-  const cutoff = new Date(now);
-  cutoff.setDate(cutoff.getDate() + 1);
-  cutoff.setHours(23, 59, 59, 999);
-  return kickoff <= cutoff ? "open" : "soon";
+  return kickoff < jornadaCutoff() ? "open" : "soon";
+}
+
+/**
+ * Devuelve el corte de la jornada activa:
+ * mañana a las 09:00 en Europe/Madrid, expresado como Date UTC (DST-safe).
+ *
+ * Verano (CEST = UTC+2): 09:00 Madrid → 07:00 UTC
+ * Invierno (CET = UTC+1): 09:00 Madrid → 08:00 UTC
+ *
+ * Técnica: se usa el mediodía UTC del día siguiente como referencia para
+ * obtener el offset de Madrid en ese momento (nunca hay DST a las 12 UTC).
+ */
+function jornadaCutoff() {
+  const now = new Date();
+  // "YYYY-MM-DD" de hoy en Madrid — en-CA garantiza formato ISO
+  const todayMadrid = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Europe/Madrid",
+  }).format(now);
+
+  // Fecha de mañana en UTC (cubre correctamente fin de mes/año)
+  const [y, mo, d] = todayMadrid.split("-").map(Number);
+  const tomorrowStr = new Date(Date.UTC(y, mo - 1, d + 1)).toISOString().slice(0, 10);
+
+  // Offset Madrid en ese día: mediodía UTC como referencia neutral
+  const noonRef = new Date(tomorrowStr + "T12:00:00Z");
+  const parts = new Intl.DateTimeFormat("en-u-hc-h23", {
+    timeZone: "Europe/Madrid",
+    hour:     "2-digit",
+    minute:   "2-digit",
+  }).formatToParts(noonRef);
+  const madridH = Number(parts.find(p => p.type === "hour")?.value   ?? "14");
+  const madridM = Number(parts.find(p => p.type === "minute")?.value ?? "0");
+
+  // offsetMin > 0 significa Madrid adelantado respecto a UTC (normal en Europa)
+  const offsetMin    = madridH * 60 + madridM - 12 * 60; // p.ej. 120 en CEST
+  const cutoffUtcMin = 9 * 60 - offsetMin;               // p.ej. 420 → 07:00 UTC
+
+  const cutoffH = Math.floor(cutoffUtcMin / 60);
+  const cutoffM = cutoffUtcMin % 60;
+  return new Date(
+    tomorrowStr + "T" +
+    String(cutoffH).padStart(2, "0") + ":" +
+    String(cutoffM).padStart(2, "0") + ":00Z",
+  );
 }
 
 /** Formatea el kickoff UTC al locale del usuario. */
